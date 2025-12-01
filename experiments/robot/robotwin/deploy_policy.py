@@ -354,7 +354,7 @@ def eval(TASK_ENV, model, observation):
     for action in action_chunk:  # Execute each step of the action
         TASK_ENV.take_action(
             action, action_type="ee"
-        )  # delta endpose control: [left_end_effector_delta (xyz + quaternion) + left_gripper + right_end_effector_delta + right_gripper]
+        )
 
         observation = TASK_ENV.get_obs()
         obs = encode_obs(observation)
