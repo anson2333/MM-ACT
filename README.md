@@ -49,7 +49,7 @@ pip install -r requirement.txt
 - **RoboTwin**
 
   For RoboTwin datasets, we utilize a dataset sampling pipeline that includes task planning generation. You can download our [datasets](https://huggingface.co/datasets/hhyhrhy/MM-ACT-data/tree/main/RoboTwin)
-  or collect your own datasets with our pipeline in [Robotwin_subtask](github_link).
+  or collect your own datasets with our pipeline in [Robotwin_subtask](github_link). This branch includes updates to original RoboTwin data collection pipeline to support our subtask text annotations. The collection usage is identical to the main branch. Please report any bugs or questions of text annotations in MM-ACT's issue.
 
 ### 3. Model Weight Preparation
 
@@ -89,11 +89,9 @@ Then refer to the [training/train_mmact_libero_action.py](training/train_mmact_l
 
 ## ⚡ Evaluation & Deployment
 
-Our trained model weight can be found at: [MM-ACT-weight](https://huggingface.co/hhyhrhy/MM-ACT-Model)
+Our trained model weights can be found at: [MM-ACT-weights](https://huggingface.co/hhyhrhy/MM-ACT-Model).
 
-For **LIBERO** evalutation, please refer to [experiments/README.md](experiments/README.md) for detailed instructions.
-
-For **RoboTwin** evaluation, please follow [Robotwin_subtask](github_link) instructions.
+For **LIBERO** and **RoboTwin** evalutation, please refer to [experiments/README.md](experiments/README.md) for detailed instructions.
 
 For real-world deployment, please refer to the script provided at: [deployment/mmact_deploy.py](deployment/mmact_deploy.py)
 
