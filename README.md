@@ -20,7 +20,6 @@ This repository contains:
 - Training pipelines and deployment scripts for one-step parallel decoding and re-mask parallel decoding strategies across three modalities: action, text, and image.
 - Scripts for evaluation on LIBERO and Robotwin, as well as the data collection pipeline used for task planning annotation on Robotwin.
 
-
 ## 🛠️ Installation
 
 ### 1. Clone Repo and Environment Setup
@@ -95,6 +94,9 @@ For **LIBERO** and **RoboTwin** evalutation, please refer to [experiments/README
 
 For real-world deployment, please refer to the script provided at: [deployment/mmact_deploy.py](deployment/mmact_deploy.py)
 
+## 🎥 Real-world Experiments (Video Demo)
+
+https://private-user-images.githubusercontent.com/91517920/520774696-02a3bf40-f1ae-4f52-9562-a3fc2e9a1477.mp4
 
 ## Acknowledgments
 
