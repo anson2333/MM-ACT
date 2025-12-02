@@ -7,7 +7,7 @@
 <br>
 
 <div align="center">
-  <img src="assets/MM-ACT.jpg" width="80%" alt="MM-ACT Arch"/>
+  <img src="assets/MM-ACT.png" width="80%" alt="MM-ACT Arch"/>
 </div>
 
 <br>
