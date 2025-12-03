@@ -94,7 +94,7 @@ RoboTwin/
       training/
         ...
 ```
-
+Both our model and baselines in our paper are trained using data collected from L515 cameras (including both head and wrist cameras). To test with our models, please modify the relevant parameters in RoboTwin configuration file (task_config/demo_randomized.yml).
 ## Acknowledgments
 
 This RoboTwin evaluation is based on [RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin.git). Thanks these great work.
