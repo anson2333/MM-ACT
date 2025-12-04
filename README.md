@@ -58,6 +58,9 @@ Download the base model weights from MMaDA: [MMaDA-8B-Base](https://huggingface.
 python model_utils/resize_model_vocab.py --model ${origin_model_path} --out ${output_model_path} --num_new ${action_codebook_size}
 ```
 
+Besides, please download the image quantizer weight from [showlab/magvitv2](https://huggingface.co/showlab/magvitv2/tree/main) 
+and update your local weight path (e.g., ```""/xxx/magvitv2""```) in ```vq_model_name``` (training configs) and ```vq_model_path``` (experiments and deployment configs).
+
 ## 🚀 Training
 
 We provide training pipelines for both LIBERO and RoboTwin. You can refer to the explanations of the configuration settings in [configs/README.md](configs/README.md).
