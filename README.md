@@ -101,6 +101,19 @@ For real-world deployment, please refer to the script provided at: [deployment/m
 
 https://private-user-images.githubusercontent.com/91517920/520774696-02a3bf40-f1ae-4f52-9562-a3fc2e9a1477.mp4
 
+## Citation
+
+If you find our work helpful, please cite us:
+
+```bibtex
+@article{liang2025mm,
+  title={MM-ACT: Learn from Multimodal Parallel Generation to Act},
+  author={Liang, Haotian and Chen, Xinyi and Wang, Bin and Chen, Mingkang and Liu, Yitian and Zhang, Yuhao and Chen, Zanxin and Yang, Tianshuo and Chen, Yilun and Pang, Jiangmiao and others},
+  journal={arXiv preprint arXiv:2512.00975},
+  year={2025}
+}
+```
+
 ## Acknowledgments
 
 This work is based on [MMaDA](https://github.com/Gen-Verse/MMaDA), [RoboTwin](https://github.com/robotwin-Platform/RoboTwin),
