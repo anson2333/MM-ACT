@@ -170,7 +170,7 @@ class MMACT_Deployment:
         images_tensor(List,[head_image, wrist_image]), text_task, state_tensor,previous_action_tokens([] if not used in training)
         """
         input_ids, attention_masks, prompt_id = self.input_process(inputs)
-        gen_token_ids = self.model.action_generate(
+        gen_token_ids, logits, prompt_hidden_states, action_step_map = self.model.action_generate(
             input_ids=input_ids,
             attention_mask=attention_masks,
             timesteps=self.timesteps,

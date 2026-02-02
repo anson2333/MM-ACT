@@ -68,6 +68,91 @@ def add_gumbel_noise(logits: torch.Tensor, temperature: float) -> torch.Tensor:
     gumbel_noise = (-torch.log(noise)) ** temperature
     return logits.exp() / gumbel_noise
 
+def denoise_step_map_from_history(history, mask_id: int, sample_idx: int = 0):
+    """从 history 构造 step_map，记录每个 token 首次被 unmask 的步数"""
+    L = history[0].shape[1]        
+    step_map = torch.zeros(L, dtype=torch.long)
+    prev = torch.full((L,), mask_id, dtype=torch.long)
+
+    for t, snap in enumerate(history, start=0): 
+        cur = snap[sample_idx]        
+        changed = (prev == mask_id) & (cur != mask_id)
+        step_map[changed] = t
+        prev = cur
+        if (step_map == 0).sum() == 0:     
+            break
+    return step_map
+
+
+def get_transfer_index(logits, temperature, mask_index, x, num_transfer_tokens, target='confidence', threshold=None):
+    """
+    根据置信度策略选择要 unmask 的位置
+    Args:
+        logits: (B, L, V) 模型输出的 logits
+        temperature: Gumbel 噪声温度
+        target: 置信度计算策略 ('confidence', 'margin_confidence', 'neg_entropy', 'random')
+        mask_index: (B, L) 布尔张量，当前 mask 位置
+        x: (B, L) 当前序列
+        num_transfer_tokens: (B,) 或 标量，本步要 unmask 的数量
+        threshold: 可选的置信度阈值
+    Returns:
+        x0: (B, L) 预测的 token ids
+        transfer_index: (B, L) 布尔张量，表示要更新的位置
+    """
+    logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+    x0 = torch.argmax(logits_with_noise, dim=-1)  # (B, L)
+    
+    # 计算置信度
+    if target == 'confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)  # (B, L, V)
+        x0_p = torch.squeeze(
+            torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
+        )  # (B, L)
+    elif target == 'margin_confidence':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        top2 = torch.topk(p, 2, dim=-1).values  # (B, L, 2)
+        x0_p = top2[..., 0] - top2[..., 1]
+    elif target == 'neg_entropy':
+        p = F.softmax(logits.to(torch.float64), dim=-1)
+        x0_p = -torch.sum(p * torch.log(p + 1e-10), dim=-1)
+    elif target == 'random':
+        x0_p = torch.rand((x0.shape[0], x0.shape[1]), device=x0.device)
+    else:
+        raise NotImplementedError(f"Target strategy '{target}' not implemented")
+    
+    # 只在 mask 位置保留预测值
+    x0 = torch.where(mask_index, x0, x)
+    
+    # 基于阈值的选择
+    if threshold is not None:
+        selected = mask_index & (x0_p >= threshold)
+        has_mask = mask_index.any(dim=-1)
+        none_sel = (~selected.any(dim=-1)) & has_mask
+        
+        if none_sel.any():
+            masked_scores = x0_p.masked_fill(~mask_index, float("-inf"))
+            best_idx = masked_scores.argmax(dim=-1)
+            rows = torch.nonzero(none_sel, as_tuple=False).squeeze(-1)
+            selected[rows, best_idx[rows]] = True
+        
+        return x0, selected
+    
+    # 基于 top-k 的选择
+    confidence = x0_p.masked_fill(~mask_index, float("-inf"))
+    transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+    
+    for j in range(confidence.shape[0]):
+        k = int(
+            num_transfer_tokens[j].item() 
+            if torch.is_tensor(num_transfer_tokens[j]) 
+            else num_transfer_tokens[j]
+        )
+        if k <= 0:
+            continue
+        _, sel = torch.topk(confidence[j], k=k)
+        transfer_index[j, sel] = True
+    
+    return x0, transfer_index
 
 def get_num_transfer_tokens(mask_index: torch.Tensor, steps: int) -> torch.Tensor:
     """
@@ -145,7 +230,7 @@ class MMACTModelLM(MMadaModelLM):
         attention_mask: Optional[torch.LongTensor] = None,
         temperature: float = 1.0,
         prompt_id: Optional[int] = None,
-        timesteps: int = 6,
+        timesteps: int = 4,
         guidance_scale: float = 0.0,  # not used in our work
         noise_schedule: Callable[[torch.Tensor], torch.Tensor] = cosine_schedule,
         generator: Optional[torch.Generator] = None,
@@ -156,81 +241,102 @@ class MMACTModelLM(MMadaModelLM):
         vocab_offset: int = 134656,
         action_vocab_size: int = 1024,
         **kwargs,
-    ) -> torch.LongTensor:
+    ) -> tuple[torch.LongTensor, torch.FloatTensor, torch.FloatTensor]: # [修改 1] 返回增加 Hidden States
         """
         Parallel MaskGIT-style decoding for *action* tokens.
+        Returns:
+            sampled_ids: [Batch, Chunk*Dim]
+            logits: [Batch, Chunk*Dim, Action_Vocab_Size]
+            prompt_hidden_states: [Batch, Seq_Len, Hidden_Dim] (来自第一步推理)
         """
         if prompt_id is None:
             raise ValueError("action_generate requires `prompt_id` (index of <soa>).")
 
         num_action_tokens = chunk_size * action_dim
         num_new_special_tokens = 0
+        
+        B, L0 = input_ids.shape
+        # 初始化 logits 变量，防止 timesteps=0 的极端情况（虽然一般不会发生）
+        logits = None
+        prompt_hidden_states = None # [修改 2] 初始化 hidden_states 容器
+        
+        if action_dim == 7:
+            s = L0 - num_action_tokens*2 - 1  # the first token of action_tokens
+            e = L0 - num_action_tokens - 1
+        else: 
+            s = L0 - num_action_tokens - 1
+            e = L0 - 1
+            
+        num_transfer = get_num_transfer_tokens((input_ids[:, s:e] == mask_token_id), timesteps)
 
-        # Slice covering the action block
-        action_slice = slice(prompt_id + 1, prompt_id + 1 + num_action_tokens)
-
-        # Shift away vocab offset so we can work in [0, action_vocab_size)
-        input_ids_minus_offset = input_ids[:, action_slice].clone()
-        input_ids_minus_offset = torch.where(
-            input_ids_minus_offset == mask_token_id,
-            mask_token_id,
-            input_ids_minus_offset - vocab_offset - num_new_special_tokens,
+        hist: List[torch.Tensor] = []
+        sampled_ids: List[torch.Tensor] = []
+        action_step_map: List[torch.Tensor] = []
+        
+        attention_bias = (
+            (attention_mask[:, :, None] & attention_mask[:, None, :])
+            .bool()
+            .unsqueeze(1)
         )
+        out = self(input_ids,
+                   attention_bias = attention_bias,
+                   output_hidden_states = True,
+                   use_cache=False)
+        logits = out.logits
+        prompt_hidden_states = out.hidden_states[-1]
 
-        for step in range(timesteps):
-            attention_bias = (
-                (attention_mask[:, :, None] & attention_mask[:, None, :])
-                .bool()
-                .unsqueeze(1)
+        mask_all = (input_ids == mask_token_id)
+        # only consider up to block end
+        mask_all[:, e:] = 0
+
+        x0, tr_idx = get_transfer_index(
+            logits, temperature,  mask_all, input_ids, num_transfer[:, 0]
+        )
+        nfe = 0
+        input_ids[tr_idx] = x0[tr_idx]
+        hist.append(input_ids.clone().cpu())
+        nfe +=1
+        
+        i = 1
+        
+        while True:
+            mask_all = (input_ids == mask_token_id)
+            
+            if not mask_all.any():
+                break
+            
+            logits = self(input_ids, 
+                          attention_bias = attention_bias,
+                          output_hidden_states = True,
+                          use_cache=False).logits
+            # slice suffix starting at s
+            logits = logits[:, s:e]
+            
+            x0, tr_idx = get_transfer_index(
+                logits, temperature, mask_all[:,s:e], input_ids[:, s:e], num_transfer[:, i]
             )
-            logits = self(input_ids, attention_bias=attention_bias).logits
-            logits = logits[
-                :,
-                action_slice,
-                vocab_offset : vocab_offset + action_vocab_size,
-            ]
-            probs = logits.softmax(dim=-1)
-            sampled = probs.reshape(-1, probs.size(-1))
-            sampled_ids = torch.multinomial(sampled, 1, generator=generator)[:, 0].view(
-                *logits.shape[:-1]
+            input_ids[:,s:e][tr_idx] = x0[tr_idx]
+            
+            hist.append(input_ids.clone().cpu())
+            nfe += 1
+            
+            if (input_ids[:, s:e] == mask_token_id).sum() == 0:
+                break
+            i += 1
+        
+        for i in range(B):
+            step_map_i = denoise_step_map_from_history(
+                hist, mask_id=mask_token_id, sample_idx=i
             )
-
-            unknown_map = input_ids_minus_offset == mask_token_id
-            sampled_ids = torch.where(unknown_map, sampled_ids, input_ids_minus_offset)
-
-            ratio = float(step + 1) / float(timesteps)
-            mask_ratio = noise_schedule(torch.tensor(ratio, device=input_ids.device))
-
-            selected_probs = torch.gather(
-                probs, -1, sampled_ids.long()[..., None]
-            ).squeeze(-1)
-            selected_probs = torch.where(
-                unknown_map,
-                selected_probs,
-                torch.finfo(selected_probs.dtype).max,
-            )
-
-            mask_len = (
-                (num_action_tokens * mask_ratio).floor().unsqueeze(0).to(logits.device)
-            )
-            mask_len = torch.max(
-                torch.tensor([1], device=logits.device),
-                torch.min(unknown_map.sum(dim=-1, keepdim=True) - 1, mask_len),
-            )
-
-            temperature_step = temperature * (1.0 - ratio)
-            masking = mask_by_random_topk(
-                mask_len, selected_probs, temperature_step, generator=generator
-            )
-
-            input_ids[:, action_slice] = torch.where(
-                masking,
-                mask_token_id,
-                sampled_ids + vocab_offset + num_new_special_tokens,
-            )
-            input_ids_minus_offset = torch.where(masking, mask_token_id, sampled_ids)
-
-        return sampled_ids
+            action_step_map.append(step_map_i[s:e])
+            sampled_ids.append(input_ids[i,s:e].clone().cpu())
+            
+        sampled_ids = torch.stack(sampled_ids)
+        action_step_map = torch.stack(action_step_map)
+        
+        logits = logits.to(sampled_ids.device)
+        # [修改 5] 返回四个值
+        return sampled_ids, logits, prompt_hidden_states, action_step_map
 
     # ------------------------------------------------------------------
     # multi-task forward with action / t2i / lm / mmu
@@ -425,7 +531,8 @@ class MMACTModelLM(MMadaModelLM):
     ) -> torch.Tensor:
         """
         Margin-based variant of cross-entropy.
-
+        基于 margin 的策略——若模型的 argmax 落在 GT 周围一定半径内，
+        就把 argmax 的概率当作“正确”的 log-prob 来计算损失；否则仍使用 GT 的 log-prob
         If the argmax token is within ``action_err_token_len`` of the ground-truth id,
         we treat argmax as correct (use its log-prob); otherwise we use the
         ground-truth token's log-prob.
@@ -434,12 +541,14 @@ class MMACTModelLM(MMadaModelLM):
         max_logprob, argmax_ids = torch.max(log_probs, dim=-1)  # [B, T], [B, T]
 
         valid = labels.ne(ignore_index)  # [B, T]
-        safe_labels = labels.masked_fill(~valid, 0)
+        safe_labels = labels.masked_fill(~valid, 0) # 为避免无效位置带来的索引问题，先把无效位置的索引换成 0
 
-        true_logprob = log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+        true_logprob = log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)  # 取出“真实 id 的 log-prob”
 
         use_max = argmax_ids.sub(safe_labels).abs().le(action_err_token_len) & valid
         chosen_logprob = torch.where(use_max, max_logprob, true_logprob)
+            # 当模型 argmax id 与真实 id 的绝对差 <= action_err_token_len 时，
+            # 把模型 argmax 的 log-prob 当作 chosen_logprob；否则用真实 id 的 log-prob。
         per_token_loss = -chosen_logprob.masked_fill(~valid, 0.0)
 
         if reduction == "mean":
@@ -461,10 +570,15 @@ class MMACTModelLM(MMadaModelLM):
     ) -> torch.Tensor:
         """
         Soft cross-entropy over a local Gaussian window around the ground-truth id.
-
+        在 GT 周围构造一个离散高斯分布作为软目标（GT 附近的 id 也应得概率质量），
+        然后计算这个软目标与模型分布的交叉熵（即对 GT 及邻近 id 进行平滑监督）。
         Tokens within +/- ``radius`` of the GT id receive non-zero mass according
         to a discrete Gaussian kernel whose tail value at the window edge is
         approximately ``at_value``.
+        对每个 token，构建一个软目标概率分布 q over tokens limited to GT±r，
+        权重由离散高斯给出并归一化： q_k ∝ exp(-0.5 * (k - GT)^2 / sigma^2)
+        目标损失是 KL(q || p) up to constants, 或等价地： - sum_k q_k log p_k. 
+        因为 q 是“软标签”，模型被鼓励把概率质量放在 GT 及其邻近位置上，而不是把质量全部压在单点上。
         """
         B, T, V = logits.shape
 
@@ -509,16 +623,18 @@ class MMACTModelLM(MMadaModelLM):
         Standalone forward for action training only.
         """
         attention_bias_action = (
-            (attention_masks[:, :, None] & attention_masks[:, None, :])
-            .bool()
-            .unsqueeze(1)
-        )
+            (attention_masks[:, :, None] & attention_masks[:, None, :])     # (B,L,1)和(B,1,L)按位与运算得到(B,L,L)
+            .bool()     
+            .unsqueeze(1)   # (B,L,L)->(B,1,L,L)
+        )   # 代表哪个token对哪个token有效，双向token-level的注意力可见矩阵
         logits = self(input_ids, attention_bias=attention_bias_action).logits
 
-        self.output_size = logits.shape[-1]
+        self.output_size = logits.shape[-1]     # 输出词表的大小
         action_logits = logits[:, max_seq_length + 1 :].contiguous()
         action_labels = labels[:, max_seq_length + 1 :].contiguous()
 
+        # 动作 token 空间通常是离散化的但有序（相邻 id 含义相近），因此直接的 plain cross-entropy（把全部概率压在单一 GT id 上）可能过于苛刻。
+        # 下面两个loss计算分别实现了两种“宽容/平滑”策略
         if action_loss_type == "multi":
             loss_action_modified = self.modified_ce_with_margin_rule(
                 action_logits,

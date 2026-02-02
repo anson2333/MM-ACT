@@ -85,6 +85,8 @@ class UniversalPrompting:
             self.sptids_dict["<|eot|>"] = torch.tensor(
                 [self.text_tokenizer.eos_token_id]
             )
+            
+            #  end_header_tokens用于chat模式下  区分 header和正文
             end_header_tokens = self.text_tokenizer.convert_tokens_to_ids(
                 ["<|end_header_id|>"]
             )
@@ -100,7 +102,7 @@ class UniversalPrompting:
                 self.sptids_dict["<|start_header_id|>"] = torch.tensor(
                     self.text_tokenizer.convert_tokens_to_ids(["<|start_header_id|>"])
                 )
-            else:
+            else:    # 如果 tokenizer 中没有这些特殊标记，则添加它们
                 special_tokens_dict = {
                     "additional_special_tokens": [
                         "<|start_header_id|>",
@@ -129,19 +131,23 @@ class UniversalPrompting:
         self.cond_dropout_prob = cond_dropout_prob
 
     def t2i_prompt(self, text_ids, image_ids, labels):
+        # text-to-image 和 mmada 中的函数实现方式一致
 
         device = image_ids.device
         sequence_ids = []
         attention_masks = []
         label_ids = []
-        probs = torch.rand(len(text_ids))
+        probs = torch.rand(len(text_ids))       # 为样本生成一个用于判断是否丢弃的随机数
         for i in range(len(text_ids)):
 
+            # 确保 text_ids 序列是以BOS开头
             if len(text_ids[i]) == 0:
                 text_ids[i] = [self.text_tokenizer.bos_token_id]
             elif text_ids[i][0] != self.text_tokenizer.bos_token_id:
                 text_ids[i] = [self.text_tokenizer.bos_token_id] + text_ids[i]
 
+            # 构造base text format，在text_ids序列前面加上task token<t2i>，
+            # 在text_ids序列后面加上EOS
             temp_ids = (
                 [int(self.sptids_dict["<|t2i|>"])]
                 + text_ids[i]
@@ -150,21 +156,25 @@ class UniversalPrompting:
 
             # randomly dropout text condition
             if probs[i] < self.cond_dropout_prob:
+                # classifer-free guidance 
+                # 随机丢弃部分序列的全部text_ids，只保留format，
+                # 给模型在没有text_ids提示下的temp_ids以生成图像
                 temp_ids = [
                     int(self.sptids_dict["<|t2i|>"]),
                     self.text_tokenizer.bos_token_id,
                     self.text_tokenizer.eos_token_id,
                 ]
 
+            # 下面是处理长度
             if self.max_text_len >= len(temp_ids):
                 old_len = len(temp_ids)
                 temp_ids = [self.pad_id] * (
                     self.max_text_len - len(temp_ids)
-                ) + temp_ids
+                ) + temp_ids    # 左pad把temp_ids填充到固定长度
                 temp_masks = [0] * (self.max_text_len - old_len) + [1] * (
                     old_len + image_ids.shape[-1] + 2
-                )
-            else:
+                )               # pad部分注意力为0，文本段和两个特殊标记注意力为1
+            else:   # 文本长度超过最大值，则截断
                 # should add the eos token
                 temp_ids = temp_ids[: self.max_text_len - 1] + [
                     self.text_tokenizer.eos_token_id
@@ -172,18 +182,20 @@ class UniversalPrompting:
                 temp_masks = [1] * (
                     len(temp_ids) + image_ids.shape[-1] + 2
                 )  # +2 for two special tokens
+            
             # prompting -- [task token] [sot] [text tokens] [eot] [soi] [image tokens] [eoi]
             temp_label_ids = torch.cat(
                 [
                     # should we predict text tokens when doing image reconstruction?
                     torch.tensor(temp_ids).to(device),
                     self.sptids_dict["<|soi|>"].to(device),
-                    labels[i],
+                    labels[i],      # 图像的codebook_indices量化值
                     self.sptids_dict["<|eoi|>"].to(device),
                 ],
                 dim=0,
             )
 
+            # 把pad_id替换为ignore_id，以便于计算损失时忽略pad部分
             temp_label_ids = torch.where(
                 temp_label_ids == self.pad_id, self.ignore_id, temp_label_ids
             )
@@ -192,7 +204,7 @@ class UniversalPrompting:
                 [
                     torch.tensor(temp_ids).to(device),
                     self.sptids_dict["<|soi|>"].to(device),
-                    image_ids[i],
+                    image_ids[i],       # 区别于labels的是，这是加噪或者正在mask处理的image token
                     self.sptids_dict["<|eoi|>"].to(device),
                 ],
                 dim=0,
@@ -200,9 +212,12 @@ class UniversalPrompting:
 
             # sequence_ids: [pad]...[pad] <|t2i|> <bos> text_1 ... text_n <eos> <|soi|> image_1 ... image_m <|eoi|>
             temp_masks = torch.tensor(temp_masks).to(device)
-            sequence_ids.append(temp_ids.unsqueeze(0))
+            sequence_ids.append(temp_ids.unsqueeze(0))  
             attention_masks.append(temp_masks.unsqueeze(0))
             label_ids.append(temp_label_ids.unsqueeze(0))
+            # sequence_ids和label_ids的区别是:
+            # 前面的text相同，但是后面的image token部分，对于sequence_ids是处理过程中的图像输入token
+            # 对于label_ids是原始图像的codebook_indices量化值
 
         return (
             torch.cat(sequence_ids, dim=0),
@@ -221,6 +236,8 @@ class UniversalPrompting:
         state_ids,
         config=None,
     ):
+        # 重点在于区别输入参数 image_ids, masked_ids, label_ids。
+        # masked_ids是cot过程中的预测图像，半解码半掩码状态。label_ids是将gt里的原始图像中的未来图像作为标签
         """Build prompt for image training.Important,all input have been offset"""
         max_text_len = self.max_text_len - 1
         B = len(text_ids)
@@ -228,10 +245,12 @@ class UniversalPrompting:
         for i in range(B):
             text = text_ids[i]
             action_dim = action_dims[i]
+            
             if len(text) == 0:
                 text = [self.text_tokenizer.bos_token_id]
             elif text[0] != self.text_tokenizer.bos_token_id:
                 text = [self.text_tokenizer.bos_token_id] + text
+                
             text = [int(self.sptids_dict["<|t2i|>"])] + text
             dim_token = "<|7dim|>" if action_dim == 7 else "<|14dim|>"
             if config and getattr(config.training, "t2i_ignore_state", False):
@@ -239,10 +258,12 @@ class UniversalPrompting:
             else:
                 state_block = self.text_tokenizer("The current states of robot is:")[
                     "input_ids"
-                ]
+                ]       # 这一步是获取 "The current states of robot is:" 这句话的input_token_ids
                 state_block += [int(self.sptids_dict["<|sostate|>"])]
                 state_block += state_ids[i].tolist()
                 state_block += [int(self.sptids_dict["<|eostate|>"])]
+                # 会构建state_block如下：
+                # “The current states of robot is:” 的 token + <|sostate|> + state_ids + <|eostate|>
             image_block = []
             images_description_text = [
                 self.text_tokenizer("The third/head view of robot is:")["input_ids"],
@@ -260,6 +281,7 @@ class UniversalPrompting:
                         "input_ids"
                     ]
                 )
+                
             for j, img in enumerate(
                 image_ids[i]
             ):  # use action dim to match images num, need to be refine
@@ -281,11 +303,12 @@ class UniversalPrompting:
                 + action_dim_block
                 + [self.text_tokenizer.eos_token_id]
             )
+            
             total_seq_len = len(seq) + 2 + len(label_ids[i])
             if max_text_len >= total_seq_len:
                 old_len = len(seq)
-                seq = [self.pad_id] * (max_text_len - total_seq_len) + seq
-                temp_masks = [0] * (max_text_len - total_seq_len) + [1] * total_seq_len
+                seq = [self.pad_id] * (max_text_len - total_seq_len) + seq      # 左pad
+                temp_masks = [0] * (max_text_len - total_seq_len) + [1] * total_seq_len # pad注意力为0，其余部分注意力为1
             else:
                 # should add the eos token
                 seq = seq[: max_text_len - len(label_ids[i]) - 3] + [
@@ -322,6 +345,7 @@ class UniversalPrompting:
             seqs.append(seq)
             masks.append(temp_masks)
             labels.append(temp_label_ids)
+            
         # MAKE SURE that the len of each tensor is equal
         return (
             torch.stack(seqs, dim=0),
@@ -353,7 +377,9 @@ class UniversalPrompting:
             elif text[0] != self.text_tokenizer.bos_token_id:
                 text = [self.text_tokenizer.bos_token_id] + text
             text = [int(self.sptids_dict["<|mm2a|>"])] + text
+            
             dim_token = "<|7dim|>" if action_dim == 7 else "<|14dim|>"
+            
             if config and getattr(config.training, "ignore_state", False):
                 state_block = []
             else:
@@ -394,6 +420,7 @@ class UniversalPrompting:
             action_dim_block = self.text_tokenizer("Robot's action dim is:")[
                 "input_ids"
             ] + [int(self.sptids_dict[dim_token])]
+            
             if prev_action_ids[i].numel() != 0:
                 pre_action_block = self.text_tokenizer("Robot's previous actions are:")[
                     "input_ids"
@@ -403,6 +430,7 @@ class UniversalPrompting:
                 pre_action_block += [int(self.sptids_dict["<|eoa|>"])]
             else:
                 pre_action_block = []
+                
             seq = (
                 text
                 + state_block
@@ -411,6 +439,7 @@ class UniversalPrompting:
                 + pre_action_block
                 + [self.text_tokenizer.eos_token_id]
             )
+            
             if self.max_action_prompt_len >= len(seq):
                 old_len = len(seq)
                 seq = [self.pad_id] * (self.max_action_prompt_len - len(seq)) + seq
@@ -425,6 +454,7 @@ class UniversalPrompting:
                 temp_masks = [1] * (
                     len(seq) + action_ids[i].shape[-1] + 2
                 )  # +2 for two special tokens
+                
             # prompting -- [task token] [sot] [text tokens] [eot] [soi] [image tokens] [eoi]
             temp_label_ids = torch.cat(
                 [

@@ -179,6 +179,7 @@ def main():
                 tokens = tokens + len(uni_prompting.text_tokenizer)
                 img_tokens.append(tokens)
             image_tokens.append(img_tokens)
+            
         action_tokens = [a.to(accelerator.device) for a in action_tokens]
         masked_action, labels, _, _ = mask_or_random_replace_action_tokens(
             action_tokens,
@@ -195,6 +196,7 @@ def main():
             seq_len = a.size(0)
             masked_list.append(masked_action[i, :seq_len].cpu())
             label_list.append(labels[i, :seq_len].cpu())
+            
         input_ids, attention_masks, label_ids = uni_prompting(
             (
                 image_tokens,

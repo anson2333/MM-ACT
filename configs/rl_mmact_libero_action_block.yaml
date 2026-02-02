@@ -1,11 +1,17 @@
 experiment:
-  project: "demo"
-  name: "test_libero_action"
-  output_dir: "outputs/test_libero_action"
+  project: "rl_mmact_libero_action"  # need to be same of this file name
+  name: ""
+  output_dir: ""
+  function: "train"   # TODO: add eval function later
+  current_epoch: 1
+  deepspeed_file: "TODO"
+  num_node: 1
+  node_index: 0  # no need to change
 
 model:
   mmact:
     pretrained_model_path: "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/mmada-modified"
+    optimized_name: "optimized"
 
   vq_model:
     type: "magvitv2"
@@ -16,9 +22,7 @@ dataset:
     max_seq_length: 1024
   dataset_file_paths: 
     - "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/datasets--lerobot--libero_10_image/snapshots/9b902906e722dbb26c29e89c6b45cd77f743d87a"
-    # - "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/datasets--lerobot--libero_object_image/snapshots/5535727f1aca007ff0d29581959ed8e033c474cb"
-    # - "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/datasets--lerobot--libero_goal_image/snapshots/7781d8bfeda8800fb1b7002829b29612e5611831"
-    # - "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/datasets--lerobot--libero_spatial_image/snapshots/90a337d91804d495726b574c1ecc2ab1c65d0465"
+  data_type: "libero_action"
 
 training:
   batch_size: 2
@@ -49,3 +53,17 @@ lr_scheduler:
         learning_rate: ${optimizer.params.learning_rate}
         warmup_steps: 500
         min_lr_scale: 0.2
+
+rollout:
+    num_task_per_step: 32
+    num_response_per_task: 8
+    temperature: 0.8
+    steps: 512
+    max_gen_length: 512
+    batch_size: 2
+    remasking_strategy: "low_confidence_static" #"low_confidence_static""low_confidence_dynamic"
+    target: "confidence" # target to decide which tokens to unmask, eg. confidence, margin_confidence and neg_entropy
+    dynamic_threshold: 0.95 # no use for "low_confidence_static"
+    block_size: 32
+    further_horizon: 128
+    use_cache: True   # TODO: 暂时没有实现True的逻辑
