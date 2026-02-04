@@ -48,8 +48,10 @@ from .configuration_llada import (
 )
 
 from .modeling_llada import LLaDAModelLM
+from .action_head import FlowMatchingActionHead
 from .modeling_mmada import MMadaConfig, MMadaModelLM
 from .sampling import cosine_schedule, mask_by_random_topk
+from models.action_head import FlowMatchingActionHead
 
 log = logging.getLogger(__name__)
 
@@ -196,8 +198,14 @@ class MMACTConfig(MMadaConfig):
 
     def __init__(
         self,
+        use_continuous_head: bool = False,
+        continuous_action_dim: int = 7,
+        continuous_head_loss_weight: float = 1.0,
         **kwargs,
     ):
+        self.use_continuous_head = use_continuous_head
+        self.continuous_action_dim = continuous_action_dim
+        self.continuous_head_loss_weight = continuous_head_loss_weight
         # Let the parent handle common fields
         super().__init__(**kwargs)
 
@@ -219,6 +227,38 @@ class MMACTModelLM(MMadaModelLM):
         print(f"Initializing MMadaModelLM with config: {config}")
         # Reuse MMadaModelLM initialization
         super().__init__(config, *args, **kwargs)
+
+        if getattr(config, "use_continuous_head", False):
+            # We assume d_model is available in config, typically implied by the parent class
+            hidden_size = config.d_model
+            action_dim = getattr(config, "continuous_action_dim", 7)
+            
+            # Use FlowMatchingActionHead instead of simple MLP
+            self.continuous_head = FlowMatchingActionHead(
+                input_dim=hidden_size,  # Transformer hidden size
+                hidden_dim=getattr(config, "flow_matching_hidden_dim", 4096),
+                action_dim=action_dim
+            )
+            # Initialize weights? usually handled by post_init or let pytorch default
+            # self.continuous_head.apply(self._init_weights) # if needed
+
+    def _get_gen_indices(self, input_ids: torch.LongTensor) -> Optional[torch.Tensor]:
+        # Helper to identify generation (Action) tokens for MoT routing
+        mask_token_id = getattr(self.config, "mask_token_id", 126336)
+        vocab_offset = getattr(self.config, "vocab_offset", 134656) 
+        action_vocab_size = getattr(self.config, "action_vocab_size", 1024)
+        
+        # Action tokens are either MASK tokens or in the Action Vocab range
+        is_gen = (input_ids == mask_token_id) | \
+                 ((input_ids >= vocab_offset) & (input_ids < vocab_offset + action_vocab_size))
+                 
+        if not is_gen.any():
+            return None
+            
+        # Return flattened indices
+        is_gen_flat = is_gen.view(-1)
+        gen_indices = torch.nonzero(is_gen_flat, as_tuple=True)[0]
+        return gen_indices
 
     # ------------------------------------------------------------------
     # Action generation (MaskGIT-style over action tokens)
@@ -278,10 +318,12 @@ class MMACTModelLM(MMadaModelLM):
             .bool()
             .unsqueeze(1)
         )
+        gen_indices = self._get_gen_indices(input_ids)
         out = self(input_ids,
                    attention_bias = attention_bias,
                    output_hidden_states = True,
-                   use_cache=False)
+                   use_cache=False,
+                   gen_indices=gen_indices)
         logits = out.logits
         prompt_hidden_states = out.hidden_states[-1]
 
@@ -305,10 +347,12 @@ class MMACTModelLM(MMadaModelLM):
             if not mask_all.any():
                 break
             
+            gen_indices = self._get_gen_indices(input_ids)
             logits = self(input_ids, 
                           attention_bias = attention_bias,
                           output_hidden_states = True,
-                          use_cache=False).logits
+                          use_cache=False,
+                          gen_indices=gen_indices).logits
             # slice suffix starting at s
             logits = logits[:, s:e]
             
@@ -360,6 +404,7 @@ class MMACTModelLM(MMadaModelLM):
         answer_lengths_lm: Optional[torch.Tensor] = None,
         action_err_token_len: int = 10,
         at_value: float = 1e-3,
+        continuous_labels: Optional[torch.Tensor] = None,
     ):
         """
         Forward pass that can handle four task types(three in use) in a single
@@ -396,7 +441,10 @@ class MMACTModelLM(MMadaModelLM):
                 attention_bias_t2i
             )
 
-        logits = self(input_ids, attention_bias=attention_bias).logits
+        # logits = self(input_ids, attention_bias=attention_bias).logits
+        gen_indices = self._get_gen_indices(input_ids)
+        outputs = self(input_ids, attention_bias=attention_bias, output_hidden_states=True, gen_indices=gen_indices)
+        logits = outputs.logits
         self.output_size = logits.shape[-1]
 
         # ------------------------------------------------------------------
@@ -435,6 +483,54 @@ class MMACTModelLM(MMadaModelLM):
                 raise ValueError(f"Unsupported action_loss_type: {action_loss_type}")
         else:
             loss_action = torch.tensor(0.0, device=input_ids.device)
+
+        # ------------------------------------------------------------------
+        # Loss: Continuous Action (Flow Matching)
+        # ------------------------------------------------------------------
+        loss_continuous = torch.tensor(0.0, device=input_ids.device)
+        if batch_size_action > 0 and getattr(self.config, "use_continuous_head", False) and continuous_labels is not None:
+            # Extract hidden states: [B, Seq - Prompt - 1, Hidden]
+            # Match the slice used for action_logits but shifted by 1 for causality
+            # action_logits used [max_action_prompt_len + 1 :]
+            # So hidden states should come from [max_action_prompt_len : -1] ??
+            # Actually, outputs.hidden_states[-1] is full sequence.
+            # We want the hidden states that PREDICT the action tokens.
+            # continuous_labels are "ground truth" for the action.
+            # We want to condition on the state *before* the action (or during).
+            # If we condition on VLM hidden states, we typically use the full sequence of action tokens.
+            
+            # Use the same slice length as action_labels
+            slice_start = max_action_prompt_len
+            slice_end = logits.shape[1] - 1 # Assuming prediction for last token comes from second to last hidden state?
+            # Or if logits are aligned with input_ids (usual HF way), logits[i] is pred for input[i+1].
+            # logits has shape [B, SeqLen, V].
+            # input_ids has shape [B, SeqLen].
+            # If we used `action_logits` from `max_action_prompt_len + 1`...
+            # The indices are `max_action_prompt_len + 1` to `End`.
+            # The hidden states generating these are `max_action_prompt_len` to `End - 1`.
+            
+            hidden_states = outputs.hidden_states[-1]
+            action_hidden_states = hidden_states[:batch_size_action, slice_start : -1].contiguous()
+            
+            # Verify shapes match
+            # continuous_labels: [B, Chunk, Dim]
+            # action_hidden_states: [B, T_action_tokens, Hidden]
+            # T_action_tokens should equal Chunk * Dim (if 1 token per dim).
+            # Or check config.
+            
+            # Sample noise
+            return_dict = self.continuous_head.sample_noisy_actions(continuous_labels)
+            noisy_actions = return_dict["noisy_actions"]
+            timesteps = return_dict["timestep_embeddings"]
+            target_flow = return_dict["flow"]
+            
+            # Predict
+            velocity_pred = self.continuous_head.predict_velocity(
+                action_hidden_states, noisy_actions, timesteps
+            )
+            
+            loss_continuous = F.mse_loss(velocity_pred, target_flow)
+
 
         # ------------------------------------------------------------------
         # Loss: T2I
@@ -516,7 +612,7 @@ class MMACTModelLM(MMadaModelLM):
         else:
             loss_mmu = torch.tensor(0.0, device=input_ids.device)
 
-        return logits, loss_action, loss_t2i, loss_lm, loss_mmu
+        return logits, loss_action, loss_t2i, loss_lm, loss_mmu, loss_continuous
 
     # ------------------------------------------------------------------
     # Soft loss variants used for action training
@@ -614,10 +710,12 @@ class MMACTModelLM(MMadaModelLM):
         input_ids: torch.LongTensor,
         labels: torch.LongTensor,
         attention_masks: torch.Tensor,
+        continuous_labels: Optional[torch.Tensor] = None,
         max_seq_length: int = 768,
         action_loss_type: Optional[str] = None,  # "single" | "multi" | "gaussian"
         action_err_token_len: int = 6,
         at_value: float = 0.3,
+        eoa_token_id: int = 126099,
     ):
         """
         Standalone forward for action training only.
@@ -627,7 +725,11 @@ class MMACTModelLM(MMadaModelLM):
             .bool()     
             .unsqueeze(1)   # (B,L,L)->(B,1,L,L)
         )   # 代表哪个token对哪个token有效，双向token-level的注意力可见矩阵
-        logits = self(input_ids, attention_bias=attention_bias_action).logits
+        
+        output_hidden_states = getattr(self.config, "use_continuous_head", False) and (continuous_labels is not None)
+        gen_indices = self._get_gen_indices(input_ids)
+        outputs = self(input_ids, attention_bias=attention_bias_action, output_hidden_states=output_hidden_states, gen_indices=gen_indices)
+        logits = outputs.logits
 
         self.output_size = logits.shape[-1]     # 输出词表的大小
         action_logits = logits[:, max_seq_length + 1 :].contiguous()
@@ -636,29 +738,52 @@ class MMACTModelLM(MMadaModelLM):
         # 动作 token 空间通常是离散化的但有序（相邻 id 含义相近），因此直接的 plain cross-entropy（把全部概率压在单一 GT id 上）可能过于苛刻。
         # 下面两个loss计算分别实现了两种“宽容/平滑”策略
         if action_loss_type == "multi":
-            loss_action_modified = self.modified_ce_with_margin_rule(
+            loss_action = self.modified_ce_with_margin_rule(
                 action_logits,
                 action_labels,
                 ignore_index=-100,
                 action_err_token_len=action_err_token_len,
             )
-            return logits, loss_action_modified
-        if action_loss_type == "gaussian":
-            loss_action_soft = self.gaussian_soft_ce_window(
+        elif action_loss_type == "gaussian":
+            loss_action = self.gaussian_soft_ce_window(
                 action_logits,
                 action_labels,
                 ignore_index=-100,
                 radius=int(action_err_token_len / 2.0),
                 at_value=at_value,
             )
-            return logits, loss_action_soft
+        else:
+            # default: plain cross-entropy
+            loss_action = F.cross_entropy(
+                action_logits.view(-1, self.output_size),
+                action_labels.view(-1),
+                ignore_index=-100,
+            )
+        
+        if output_hidden_states:
+            hidden_states = outputs.hidden_states[-1]
+            action_hidden = hidden_states[:, max_seq_length + 1 :].contiguous()
+            
+            # Flow Matching Logic
+            return_dict = self.continuous_head.sample_noisy_actions(continuous_labels)
+            noisy_actions = return_dict["noisy_actions"]
+            timesteps = return_dict["timestep_embeddings"]
+            target_flow = return_dict["flow"]
+            
+            # Trim hidden states to match required length (Chunk * Dim)
+            required_len = noisy_actions.shape[1] * self.continuous_head.action_dim
+            if action_hidden.shape[1] > required_len:
+                action_hidden = action_hidden[:, :required_len]
+                
+            velocity_pred = self.continuous_head.predict_velocity(
+                action_hidden, noisy_actions, timesteps
+            )
+            
+            loss_cont = F.mse_loss(velocity_pred, target_flow)
+            
+            weight = getattr(self.config, "continuous_head_loss_weight", 1.0)
+            loss_action = loss_action + weight * loss_cont
 
-        # default: plain cross-entropy
-        loss_action = F.cross_entropy(
-            action_logits.view(-1, self.output_size),
-            action_labels.view(-1),
-            ignore_index=-100,
-        )
         return logits, loss_action
 
     # ------------------------------------------------------------------

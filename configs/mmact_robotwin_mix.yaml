@@ -6,6 +6,10 @@ experiment:
 model:
   mmact:
     pretrained_model_path: ""
+  
+  use_continuous_head: True
+  flow_matching_hidden_dim: 4096
+  continuous_action_dim: 7 # Or 16 depending on robotwin
 
   vq_model:
     type: "magvitv2"
@@ -26,6 +30,7 @@ training:
   co_t2i: True
   co_mmu: True
   mmu_ignore_state: True
+  freeze_backbone: True  # Strategy 1: Freeze Backbone
   mmu_learn_eos: False #if mmu generation learn to generate <eos>
   t2i_ignore_state: True
   num_epochs: 50

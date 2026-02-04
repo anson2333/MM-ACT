@@ -384,7 +384,7 @@ def main():
                     (labels_action, labels_mmu.to(labels_action.device)), dim=0
                 )
 
-                logits, loss_action, loss_t2i, loss_lm, loss_mmu = (
+                logits, loss_action, loss_t2i, loss_lm, loss_mmu, _ = (
                     model.forward_process_vla(
                         input_ids=input_ids,
                         labels=labels,

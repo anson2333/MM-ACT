@@ -738,6 +738,11 @@ class LLaDABlock(nn.Module):
         if config.block_type == BlockType.sequential:
             return LLaDASequentialBlock(layer_id, config, cache)
         elif config.block_type == BlockType.llama:
+            # Check if this layer should be MoT
+            min_layer = getattr(config, "min_mot_layer", 0)
+            max_layer = getattr(config, "max_mot_layer", 1000)
+            if min_layer <= layer_id <= max_layer:
+                return LLaDALlamaMoTBlock(layer_id, config, cache)
             return LLaDALlamaBlock(layer_id, config, cache)
         else:
             raise NotImplementedError(f"Unknown block type: '{config.block_type}'")
@@ -934,6 +939,206 @@ class LLaDALlamaBlock(LLaDABlock):
         return x, cache
 
 
+class LLaDALlamaMoTBlock(LLaDALlamaBlock):
+    """
+    MoT (Mixture of Transformers) version of LLaDALlamaBlock.
+    It separates processing for Understanding (VL) and Generation (Action) tokens in LNs, MLPs and QKV projections,
+    while sharing the underlying Attention mechanism (product of Q*K).
+    """
+    
+    def __init__(self, layer_id: int, config: ModelConfig, cache: BufferCache):
+        super().__init__(layer_id, config, cache)
+        # Duplicate components for the Generation (GEN) expert path
+        # Note: The 'super' init created components for the Understanding (UND) path
+        
+        # Layer norms for GEN
+        self.attn_norm_gen = LayerNorm.build(config)
+        self.ff_norm_gen = LayerNorm.build(config)
+        
+        # Attention projections for GEN
+        # Note: head_dim etc are local variables in super().__init__ but we can recompute
+        head_dim = config.d_model // config.n_heads
+        q_proj_out_dim = config.d_model
+        k_proj_out_dim = config.effective_n_kv_heads * head_dim
+        v_proj_out_dim = config.effective_n_kv_heads * head_dim
+        
+        self.q_proj_gen = nn.Linear(
+            config.d_model, q_proj_out_dim, bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+        )
+        self.k_proj_gen = nn.Linear(
+            config.d_model, k_proj_out_dim, bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+        )
+        self.v_proj_gen = nn.Linear(
+            config.d_model, v_proj_out_dim, bias=config.include_bias | config.include_qkv_bias, device=config.init_device
+        )
+        
+        # MLP for GEN
+        self.ff_proj_gen = nn.Linear(
+            config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
+        )
+        self.up_proj_gen = nn.Linear(
+            config.d_model, self.hidden_size, bias=config.include_bias, device=config.init_device
+        )
+        self.ff_out_gen = nn.Linear(
+            self.hidden_size, config.d_model, bias=config.include_bias, device=config.init_device
+        )
+
+    def reset_parameters(self):
+        super().reset_parameters()
+        self.attn_norm_gen.reset_parameters()
+        self.ff_norm_gen.reset_parameters()
+        init_weights(self.config, self.q_proj_gen, d=self.config.d_model, layer_id=None)
+        init_weights(self.config, self.k_proj_gen, d=self.config.d_model, layer_id=None)
+        init_weights(self.config, self.v_proj_gen, d=self.config.d_model, layer_id=None)
+        init_weights(self.config, self.ff_proj_gen, d=self.config.d_model, layer_id=None)
+        init_weights(self.config, self.up_proj_gen, d=self.config.d_model, layer_id=None)
+        init_weights(self.config, self.ff_out_gen, d=self.config.d_model, layer_id=None, type_of_module=ModuleType.out_module)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        gen_indices: Optional[torch.Tensor] = None, # [Num_Gen_Tokens] indices into flattened x
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        if gen_indices is None:
+            # Fallback to standard forward if no indices provided (e.g. inference without MoT or pure UND)
+            return super().forward(x, attention_bias, layer_past, use_cache)
+        
+        B, S, D = x.shape
+        x_flat = x.view(-1, D)
+        total_tokens = x_flat.shape[0]
+        
+        # Determine UND indices (all that are not GEN)
+        # Assuming gen_indices are unique and within range
+        # To do this efficiently without creating a massive mask:
+        # We rely on scatter/gather
+        
+        # 1. Pre-Attention Norm
+        # We compute Norm for ALL processing with both logic, then select.
+        # Actually it's better to select then norm to avoid noise from other modality stats?
+        # But for shape compatibility `LayerNorm` expects (..., D).
+        
+        # Efficient approach (gather -> op -> scatter)
+        
+        # Create a boolean mask for safety/convenience
+        is_gen = torch.zeros(total_tokens, dtype=torch.bool, device=x.device)
+        is_gen[gen_indices] = True
+        und_indices = torch.nonzero(~is_gen, as_tuple=True)[0]
+        
+        # --- UND Branch ---
+        x_und = x_flat[und_indices] # [N_und, D]
+        # Skip if empty (though unlikely)
+        if len(und_indices) > 0:
+            x_und_norm = self.attn_norm(x_und)
+            q_und = self.q_proj(x_und_norm)
+            k_und = self.k_proj(x_und_norm)
+            v_und = self.v_proj(x_und_norm)
+        
+        # --- GEN Branch ---
+        x_gen = x_flat[gen_indices] # [N_gen, D]
+        if len(gen_indices) > 0:
+            x_gen_norm = self.attn_norm_gen(x_gen)
+            q_gen = self.q_proj_gen(x_gen_norm)
+            k_gen = self.k_proj_gen(x_gen_norm)
+            v_gen = self.v_proj_gen(x_gen_norm)
+            
+        # --- Reassemble Q, K, V ---
+        # Initialize containers matching flattened shapes of Q, K, V
+        # q: [Total, D], k, v: [Total, D_kv]
+        q_d = self.q_proj.out_features
+        kv_d = self.k_proj.out_features
+        
+        q_flat = torch.zeros(total_tokens, q_d, dtype=x.dtype, device=x.device)
+        k_flat = torch.zeros(total_tokens, kv_d, dtype=x.dtype, device=x.device)
+        v_flat = torch.zeros(total_tokens, kv_d, dtype=x.dtype, device=x.device)
+        
+        if len(und_indices) > 0:
+            q_flat[und_indices] = q_und
+            k_flat[und_indices] = k_und
+            v_flat[und_indices] = v_und
+            
+        if len(gen_indices) > 0:
+            q_flat[gen_indices] = q_gen
+            k_flat[gen_indices] = k_gen
+            v_flat[gen_indices] = v_gen
+            
+        # Reshape to (B, S, D_out)
+        q = q_flat.view(B, S, q_d)
+        k = k_flat.view(B, S, kv_d)
+        v = v_flat.view(B, S, kv_d)
+        
+        # --- Attention ---
+        # Shared Attention Mechanism
+        if self._activation_checkpoint_fn is not None:
+            att, cache = self._activation_checkpoint_fn(
+                self.attention, q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache
+            )
+        else:
+            att, cache = self.attention(q, k, v, attention_bias, layer_past=layer_past, use_cache=use_cache)
+            
+        # Add residual to x (before next block)
+        x = x + self.dropout(att)
+        
+        # --- MLP Block ---
+        # Again, split processing
+        og_x = x
+        x_flat = x.view(-1, D)
+        
+        # Re-fetch splits (x has changed)
+        x_und = x_flat[und_indices]
+        x_gen = x_flat[gen_indices]
+        
+        # Output container
+        out_flat = torch.zeros(total_tokens, D, dtype=x.dtype, device=x.device)
+        
+        # UND MLP
+        if len(und_indices) > 0:
+            if self._activation_checkpoint_fn is not None:
+                x_u = self._activation_checkpoint_fn(self.ff_norm, x_und)
+            else:
+                x_u = self.ff_norm(x_und)
+                
+            x1, x2 = self.ff_proj(x_u), self.up_proj(x_u)
+            
+            if self._activation_checkpoint_fn is not None:
+                x_u = self._activation_checkpoint_fn(self.act, x1)
+            else:
+                x_u = self.act(x1)
+                
+            x_u = x_u * x2
+            x_u = self.ff_out(x_u)
+            x_u = self.dropout(x_u)
+            
+            out_flat[und_indices] = x_u
+            
+        # GEN MLP
+        if len(gen_indices) > 0:
+            if self._activation_checkpoint_fn is not None:
+                x_g = self._activation_checkpoint_fn(self.ff_norm_gen, x_gen)
+            else:
+                x_g = self.ff_norm_gen(x_gen)
+                
+            x1, x2 = self.ff_proj_gen(x_g), self.up_proj_gen(x_g)
+            
+            if self._activation_checkpoint_fn is not None:
+                x_g = self._activation_checkpoint_fn(self.act, x1)
+            else:
+                x_g = self.act(x1)
+                
+            x_g = x_g * x2
+            x_g = self.ff_out_gen(x_g)
+            x_g = self.dropout(x_g)
+            
+            out_flat[gen_indices] = x_g
+            
+        # Final Residual
+        x = og_x + out_flat.view(B, S, D)
+        
+        return x, cache
+
+
 class LLaDAOutput(NamedTuple):
     logits: torch.FloatTensor
     """
@@ -979,11 +1184,22 @@ class LLaDABlockGroup(nn.ModuleList):
         attention_bias: Optional[torch.FloatTensor] = None,
         layers_past: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
+        gen_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[List[Tuple[torch.Tensor, torch.Tensor]]]]:
         attn_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = [] if use_cache else None
         for block_idx, block in enumerate(self):
             layer_past = None if layers_past is None else layers_past[block_idx]
             block_idx += self.layer_offset
+            
+            # Prepare kwargs for block execution
+            block_kwargs = {
+                "attention_bias": attention_bias,
+                "layer_past": layer_past,
+                "use_cache": use_cache
+            }
+            if isinstance(block, LLaDALlamaMoTBlock):
+                block_kwargs["gen_indices"] = gen_indices
+
             if (
                 (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
                 or (
@@ -1001,11 +1217,11 @@ class LLaDABlockGroup(nn.ModuleList):
             ):
                 # shape: (batch_size, seq_len, d_model)
                 x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
-                )
+                    block, x, **block_kwargs
+                )       # TODO checkpoint中不匹配
             else:
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                x, cache = block(x, **block_kwargs)
             if attn_key_values is not None:
                 assert cache is not None
                 attn_key_values.append(cache)
@@ -1168,6 +1384,7 @@ class LLaDAModel(nn.Module):
         use_cache: bool = False,
         last_logits_only: bool = False,
         output_hidden_states: Optional[bool] = None,
+        gen_indices: Optional[torch.Tensor] = None,
     ) -> LLaDAOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -1298,6 +1515,16 @@ class LLaDAModel(nn.Module):
                     all_hidden_states.append(x)
 
                 layer_past = None if past_key_values is None else past_key_values[block_idx]
+                
+                # Prepare kwargs for block execution
+                block_kwargs = {
+                    "attention_bias": attention_bias,
+                    "layer_past": layer_past,
+                    "use_cache": use_cache
+                }
+                if isinstance(block, LLaDALlamaMoTBlock):
+                    block_kwargs["gen_indices"] = gen_indices
+
                 if (
                     (self.activation_checkpointing_strategy == ActivationCheckpointingStrategy.whole_layer)
                     or (
@@ -1315,11 +1542,11 @@ class LLaDAModel(nn.Module):
                 ):
                     # shape: (batch_size, seq_len, d_model)
                     x, cache = self._activation_checkpoint_fn(
-                        block, x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache
-                    )
+                        block, x, **block_kwargs
+                    )       # TODO checkpoint中不匹配
                 else:
                     # shape: (batch_size, seq_len, d_model)
-                    x, cache = block(x, attention_bias=attention_bias, layer_past=layer_past, use_cache=use_cache)
+                    x, cache = block(x, **block_kwargs)
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -1337,7 +1564,7 @@ class LLaDAModel(nn.Module):
                     ]
                 )
                 x, cache = block_group(
-                    x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache
+                    x, attention_bias=attention_bias, layers_past=layers_past, use_cache=use_cache, gen_indices=gen_indices
                 )
                 if attn_key_values is not None:
                     assert cache is not None
@@ -1412,6 +1639,7 @@ class LLaDAModelLM(PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[Cache] = None,  # This is a hack mitigation of an issue in transformers `4.39.x`
+        gen_indices: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if use_cache is None:
             use_cache = self.config.use_cache
@@ -1430,6 +1658,7 @@ class LLaDAModelLM(PreTrainedModel):
             past_key_values=None,
             use_cache=False,
             output_hidden_states=output_hidden_states,
+            gen_indices=gen_indices,
         )
 
         logits = outputs.logits

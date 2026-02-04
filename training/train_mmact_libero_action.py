@@ -79,8 +79,16 @@ def main():
         padding_side="left",
         local_files_only=True,
     )
+    
+    # Load model with continuous head config if present
+    use_continuous_head = config.model.mmact.get("use_continuous_head", False)
+    continuous_head_loss_weight = config.model.mmact.get("continuous_head_loss_weight", 1.0)
+    
     model = MMACTModelLM.from_pretrained(
-        config.model.mmact.pretrained_model_path, torch_dtype=torch.bfloat16
+        config.model.mmact.pretrained_model_path, 
+        torch_dtype=torch.bfloat16,
+        use_continuous_head=use_continuous_head,
+        continuous_head_loss_weight=continuous_head_loss_weight,
     )
     model.to(accelerator.device)
     action_vocab_size = model.config.action_vocab_size
@@ -166,9 +174,15 @@ def main():
     )
 
     def prepare_inputs_and_labels(batch, is_train=True, seed=None):
-        images, texts, state_tokens, prev_action_tokens, action_tokens, action_dims = (
-            batch
-        )
+        (
+            images,
+            texts,
+            state_tokens,
+            prev_action_tokens,
+            action_tokens,
+            action_vals,
+            action_dims,
+        ) = batch
         image_tokens = []
         for imgs in images:
             img_tokens = []
@@ -192,10 +206,24 @@ def main():
             seed=seed,
         )
         masked_list, label_list = [], []
+        # Prepare continuous labels
+        continuous_labels_list = []
+        max_action_len = config.training.chunk_size * 14 + 1
+
         for i, a in enumerate(action_tokens):
             seq_len = a.size(0)
             masked_list.append(masked_action[i, :seq_len].cpu())
             label_list.append(labels[i, :seq_len].cpu())
+            
+            # Process continuous vals
+            vals = action_vals[i].to(accelerator.device) # 1D tensor
+            padded_vals = torch.zeros(max_action_len, dtype=torch.float32, device=accelerator.device)
+            # Fill valid values. Note: vals length should be chunk_size*action_dim
+            current_len = vals.size(0)
+            padded_vals[:current_len] = vals
+            continuous_labels_list.append(padded_vals)
+
+        continuous_labels = torch.stack(continuous_labels_list)
             
         input_ids, attention_masks, label_ids = uni_prompting(
             (
@@ -215,6 +243,7 @@ def main():
             input_ids.to(accelerator.device),
             label_ids.to(accelerator.device),
             attention_masks.to(accelerator.device),
+            continuous_labels,
         )
 
     ##################################
@@ -316,11 +345,12 @@ def main():
             )
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(model):
-                input_ids, labels, attention_masks = prepare_inputs_and_labels(batch)
+                input_ids, labels, attention_masks, continuous_labels = prepare_inputs_and_labels(batch)
                 logits, loss = model.forward_process_action(
                     input_ids,
                     labels,
                     attention_masks,
+                    continuous_labels=continuous_labels,
                     max_seq_length=max_action_prompt_len,  # important
                     action_loss_type=config.training.action_loss_type
                     # action_err_token_len=config.training.action_err_token_len,

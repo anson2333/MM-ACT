@@ -134,6 +134,9 @@ class ActionGenerationFromLeRobotDataset(LeRobotDataset):
         # quantize continous actions to discrete action tokens
         raw_action_tokens = quantize_action(action_vals, bins=self.action_vocab_size)
         flat_action_tokens = [a for chunk in raw_action_tokens for a in chunk]
+        
+        # Flatten continuous actions to match tokens
+        flat_action_vals = torch.as_tensor(action_vals, dtype=torch.float32).flatten()
 
         action_tokens = (
             torch.tensor(flat_action_tokens, dtype=torch.long) + self.vocab_offset
@@ -160,6 +163,7 @@ class ActionGenerationFromLeRobotDataset(LeRobotDataset):
             "state_tokens": state_tokens,
             "prev_action_tokens": prev_action_tokens,
             "action_tokens": action_tokens,
+            "action_vals": flat_action_vals,
             "action_dim": self.action_dim,
         }
 
@@ -170,6 +174,7 @@ class ActionGenerationFromLeRobotDataset(LeRobotDataset):
         state_tokens = [b["state_tokens"] for b in batch]
         prev_action_tokens = [b["prev_action_tokens"] for b in batch]
         action_tokens = [b["action_tokens"] for b in batch]
+        action_vals = [b["action_vals"] for b in batch]
         action_dims = [b["action_dim"] for b in batch]
         return (
             images,
@@ -177,6 +182,7 @@ class ActionGenerationFromLeRobotDataset(LeRobotDataset):
             state_tokens,
             prev_action_tokens,
             action_tokens,
+            action_vals,
             action_dims,
         )
 
@@ -337,6 +343,7 @@ class ActionGenerationWithVqaFromLeRobotDataset(LeRobotDataset):
             "state_tokens": state_tokens,
             "prev_action_tokens": prev_action_tokens,
             "action_tokens": action_tokens,
+            "action_vals": torch.as_tensor(action_vals, dtype=torch.float32).flatten(),
             "action_dim": self.action_dim,
             "description": description,
         }
@@ -348,6 +355,7 @@ class ActionGenerationWithVqaFromLeRobotDataset(LeRobotDataset):
         state_tokens = [b["state_tokens"] for b in batch]
         prev_action_tokens = [b["prev_action_tokens"] for b in batch]
         action_tokens = [b["action_tokens"] for b in batch]
+        action_vals = [b["action_vals"] for b in batch]
         action_dims = [b["action_dim"] for b in batch]
         descriptions = [b["description"] for b in batch]
         return (
@@ -356,6 +364,7 @@ class ActionGenerationWithVqaFromLeRobotDataset(LeRobotDataset):
             state_tokens,
             prev_action_tokens,
             action_tokens,
+            action_vals,
             action_dims,
             descriptions,
         )

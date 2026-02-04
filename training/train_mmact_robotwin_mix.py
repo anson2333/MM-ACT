@@ -246,7 +246,7 @@ def main():
             action_tokens,
             action_dims,
             _,
-            _,
+            action_vals,
         ) = batch
         image_tokens = []
         for imgs in images:
@@ -277,10 +277,34 @@ def main():
             seed=seed,
         )
         masked_list, label_list = [], []
+        
+        # Prepare continuous labels [B, Chunk, Dim]
+        continuous_labels_list = []
+        chunk_size = config.training.chunk_size
+        action_dim = config.training.action_dim
+
         for i, a in enumerate(action_tokens):
             seq_len = a.size(0)
             masked_list.append(masked_action[i, :seq_len].cpu())
             label_list.append(labels[i, :seq_len].cpu())
+
+            # Action vals logic
+            vals = action_vals[i].to(accelerator.device) 
+            # Reshape to [N, Dim]
+            vals = vals.view(-1, action_dim)
+            
+            # Pad to [ChunkSize, Dim]
+            padded_vals = torch.zeros((chunk_size, action_dim), dtype=torch.float32, device=accelerator.device)
+            current_len = vals.size(0)
+            if current_len > chunk_size:
+                current_len = chunk_size
+                vals = vals[:chunk_size]
+            
+            padded_vals[:current_len] = vals
+            continuous_labels_list.append(padded_vals)
+
+        continuous_labels = torch.stack(continuous_labels_list)
+        
         input_ids, attention_masks, label_ids = uni_prompting(
             (
                 image_tokens,
@@ -300,6 +324,7 @@ def main():
             input_ids.to(accelerator.device),
             label_ids.to(accelerator.device),
             attention_masks.to(accelerator.device),
+            continuous_labels,
         )
 
     def prepare_inputs_and_labels_image(batch, is_train=True, seed=None):
@@ -354,9 +379,31 @@ def main():
     ##################################
     #   Optimizer and LR scheduler   #
     #################################
+    
+    # --- STRATEGY 1: Freeze Backbone, Train Continuous Head Only ---
+    # Check if we are using continuous head and if we want to freeze the backbone
+    if getattr(config, "use_continuous_head", False) and getattr(config.training, "freeze_backbone", False):
+        print("Strategy 1: Freezing Backbone, Training only Continuous Head")
+        
+        # 1. Freeze entire model
+        for param in model.parameters():
+            param.requires_grad = False
+            
+        # 2. Unfreeze continuous head
+        if hasattr(model, "continuous_head"):
+            for param in model.continuous_head.parameters():
+                param.requires_grad = True
+        else:
+            raise ValueError("Model does not have 'continuous_head' but use_continuous_head=True")
+            
+        # 3. (Optional) Unfreeze other specific parts if needed (e.g. adapters), 
+        # but here we strictly follow 'freeze backbone'
+    
     optimizer_config = config.optimizer.params
     # no decay on bias and layernorm and embedding
     no_decay = ["bias", "layer_norm.weight", "mlm_ln.weight", "embeddings.weight"]
+    
+    # IMPORTANT: Ensure we filter for p.requires_grad
     optimizer_grouped_parameters = [
         {
             "params": [
@@ -375,6 +422,12 @@ def main():
             "weight_decay": 0.0,
         },
     ]
+
+    # Verify we have parameters to optimize
+    trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Number of trainable parameters: {trainable_params_count}")
+    if trainable_params_count == 0:
+        raise ValueError("No trainable parameters found! Check freezing logic.")
 
     optimizer_type = config.optimizer.name
     if optimizer_type == "adamw":
@@ -467,8 +520,9 @@ def main():
                 answer_lengths_mmu = None
 
                 # --- 1) action ---
+                continuous_labels_action = None
                 if getattr(config.training, "co_action", False):
-                    input_ids_action, labels_action, attention_masks_action = (
+                    input_ids_action, labels_action, attention_masks_action, continuous_labels_action = (
                         prepare_inputs_and_labels(batch)
                     )
                     batch_size_action = input_ids_action.shape[0]
@@ -522,7 +576,7 @@ def main():
                         "No training branches enabled: set at least one of co_action/co_t2i/co_mmu to True."
                     )
                 # if need to use other loss, pass corresponding arguments to this function
-                logits, loss_action, loss_t2i, loss_lm, loss_mmu = (
+                logits, loss_action, loss_t2i, loss_lm, loss_mmu, loss_continuous = (
                     model.forward_process_vla(
                         input_ids=input_ids_all,
                         labels=labels_all,
@@ -538,6 +592,7 @@ def main():
                             attention_masks_action if batch_size_action > 0 else None
                         ),
                         t2i_masks=attention_masks_t2i if batch_size_t2i > 0 else None,
+                        continuous_labels=continuous_labels_action,
                     )
                 )
 
@@ -545,6 +600,7 @@ def main():
                     config.training.mmu_weight * loss_mmu
                     + config.training.action_weight * loss_action
                     + config.training.t2i_weight * loss_t2i
+                    + getattr(config.training, "continuous_head_loss_weight", 1.0) * loss_continuous
                 )
                 accelerator.backward(loss)
 
@@ -564,6 +620,9 @@ def main():
                 loss_t2i_avg = (
                     accelerator.gather_for_metrics(loss_t2i.detach()).mean().item()
                 )
+                loss_continuous_avg = (
+                    accelerator.gather_for_metrics(loss_continuous.detach()).mean().item()
+                )
                 try:
                     current_lr = (
                         lr_scheduler.get_last_lr()[0]
@@ -580,6 +639,7 @@ def main():
                         "train/loss_mmu": loss_mmu_avg,
                         "train/loss_action": loss_action_avg,
                         "train/loss_t2i": loss_t2i_avg,
+                        "train/loss_continuous": loss_continuous_avg,
                         "train/epoch": epoch,
                         "train/step_in_epoch": step,
                     },

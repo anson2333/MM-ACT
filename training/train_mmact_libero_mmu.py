@@ -304,7 +304,7 @@ def main():
                     )
                 )
                 batch_size_mmu = input_ids_mmu.shape[0]
-                logits, _, _, _, loss = model.forward_process_vla(
+                logits, _, _, _, loss, _ = model.forward_process_vla(
                     input_ids=input_ids_mmu,
                     labels=labels_mmu,
                     batch_size_t2i=0,
