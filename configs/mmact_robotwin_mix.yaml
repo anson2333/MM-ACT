@@ -5,15 +5,17 @@ experiment:
 
 model:
   mmact:
-    pretrained_model_path: ""
-  
+    pretrained_model_path: "/mnt/pfs/scalelab2/hms/MM-ACT/mm-act-10/LIBERO/MM-ACT-10"
+    min_mot_layer: 0
+    max_mot_layer: 1000
+
   use_continuous_head: True
   flow_matching_hidden_dim: 4096
   continuous_action_dim: 7 # Or 16 depending on robotwin
-
+  
   vq_model:
     type: "magvitv2"
-    vq_model_name: ""
+    vq_model_name: "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/models--showlab--magvitv2/snapshots/5c3fa78f8b3523347c5cd1a4c97f3c4e96f33d5d"
 
 dataset:
   combined_loader_mode: "max_size_cycle"
@@ -22,13 +24,20 @@ dataset:
   preprocessing:
     max_seq_length: 1120 #co image need to 1120-1200
   file_paths:
-    - ""
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/adjust_bottle/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/beat_block_hammer/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/click_bell/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/dump_bin_bigbin/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/lift_pot/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/move_playingcard_away/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/place_burger_fries/demo_clean"
+    - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/place_can_basket/demo_clean"
 
 training:
   batch_size: 2 # total batch size = batch size *(co_action + co_t2i + co_mmu), co_* = 0/1
   co_action: True
-  co_t2i: True
-  co_mmu: True
+  co_t2i: False
+  co_mmu: False
   mmu_ignore_state: True
   freeze_backbone: True  # Strategy 1: Freeze Backbone
   mmu_learn_eos: False #if mmu generation learn to generate <eos>

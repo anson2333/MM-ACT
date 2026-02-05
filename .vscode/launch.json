@@ -194,6 +194,55 @@
             "justMyCode": false,
             "subProcess": true
         },
+        {
+            "name": "test_for_mmact_robotwin_mix",
+            "type": "python",
+            "request": "launch",
+            // 假设这是你的主脚本路径
+            "program": "${workspaceFolder}/training/train_mmact_robotwin_mix.py", 
+            
+            // 传递给 Python 脚本的参数
+            "args": [
+                "config=configs/mmact_robotwin_mix.yaml"
+            ],
+            
+            // 核心改进：环境变量设置
+            "env": {
+
+                "PYTHONPATH": "${workspaceFolder}",
+                "MASTER_ADDR": "127.0.0.1",   // 设置为本机地址 (localhost)
+                "MASTER_PORT": "1112",        // 设置一个固定的、未被占用的端口
+                // 1. GPU 和进程设置（模拟单进程调试）
+                "CUDA_VISIBLE_DEVICES": "7", // 只使用一张卡进行调试
+                "RANK": "0",                 // 模拟当前是全局 rank 0 进程
+                "LOCAL_RANK": "0",           // 模拟当前是本地 rank 0 进程
+                "WORLD_SIZE": "1",           // **关键：在调试时设置为 1，以防卡在分布式初始化**
+                
+                // 2. 缓存和临时目录设置 (解决 No Space Left 问题)
+                "XDG_CACHE_HOME": "/mnt/pfs/scalelab2/ch/.cache",
+                "PIP_CACHE_DIR": "/mnt/pfs/scalelab2/ch/.cache/pip",
+                "HF_HOME": "/mnt/pfs/scalelab2/ch/.cache/huggingface", 
+                "TMPDIR": "/mnt/pfs/scalelab2/ch/.cache/tmp",
+                
+                // 暂时未配置加速
+                // // 3. Accelerate/DeepSpeed 配置参数
+                // "ACCELERATE_USE_DEEPSPEED": "true", // 明确告诉 Accelerate 使用 DeepSpeed
+                // "ACCELERATE_DEEPSPEED_ZERO_STAGE": "2", // 对应 zero_stage: 2
+                // "ACCELERATE_DEEPSPEED_OFFLOAD_OPTIMIZER": "cpu", // 对应 offload_optimizer_device: cpu
+                // "ACCELERATE_DEEPSPEED_OFFLOAD_PARAM": "cpu",     // 对应 offload_param_device: cpu
+                // "ACCELERATE_DEEPSPEED_GRADIENT_ACCUMULATION_STEPS": "2", // 对应 gradient_accumulation_steps: 2
+                // "ACCELERATE_DEEPSPEED_GRADIENT_CLIPPING": "1.0",         // 对应 gradient_clipping: 1.0
+                // "ACCELERATE_MIXED_PRECISION": "bf16", // 对应 mixed_precision: bf16
+                
+                // 注意：zero3_init_flag: true 无法直接通过环境变量设置，
+                // 但在 zero_stage: 2 模式下，通常不是必须的。
+                // 调试时，主要逻辑依赖于 Accelerate 加载的模型。
+            },
+            
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "subProcess": true
+        },
         
         {
             "name": "test_for_mmact_action_rollout_engine",

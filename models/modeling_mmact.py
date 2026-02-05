@@ -224,6 +224,21 @@ class MMACTModelLM(MMadaModelLM):
     base_model_prefix = "model"
 
     def __init__(self, config: MMACTConfig, *args, **kwargs):
+        # Extract custom arguments passed via from_pretrained kwargs
+        # This prevents TypeError in parent LLaDAModelLM.__init__ which doesn't accept unknown kwargs
+        use_continuous_head = kwargs.pop("use_continuous_head", None)
+        continuous_action_dim = kwargs.pop("continuous_action_dim", None)
+        flow_matching_hidden_dim = kwargs.pop("flow_matching_hidden_dim", None)
+        
+        # Update config if these values were provided
+        if use_continuous_head is not None:
+            config.use_continuous_head = use_continuous_head
+        if continuous_action_dim is not None:
+            config.continuous_action_dim = continuous_action_dim
+        if flow_matching_hidden_dim is not None:
+            config.flow_matching_hidden_dim = flow_matching_hidden_dim
+
+        
         print(f"Initializing MMadaModelLM with config: {config}")
         # Reuse MMadaModelLM initialization
         super().__init__(config, *args, **kwargs)
@@ -517,6 +532,13 @@ class MMACTModelLM(MMadaModelLM):
             # action_hidden_states: [B, T_action_tokens, Hidden]
             # T_action_tokens should equal Chunk * Dim (if 1 token per dim).
             # Or check config.
+            
+            # Trim hidden states to match required length (Chunk * Dim) if slightly larger
+            # usually caused by having an extra special token (EOS) at end of slice
+            required_len = continuous_labels.shape[1] * continuous_labels.shape[2] # Chunk * Dim
+            if action_hidden_states.shape[1] > required_len:
+                action_hidden_states = action_hidden_states[:, :required_len]
+            
             
             # Sample noise
             return_dict = self.continuous_head.sample_noisy_actions(continuous_labels)

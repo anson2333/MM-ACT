@@ -25,6 +25,19 @@ from training.robotwin_dataset import EpisodesHDF5Dataset
 from models import MMACTModelLM, MAGVITv2, get_mask_schedule
 from models.lr_schedulers import get_scheduler
 
+print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'Not Set')}")
+print(f"LOCAL_RANK: {os.environ.get('LOCAL_RANK', 'Not Set')}")
+print(f"RANK: {os.environ.get('RANK', 'Not Set')}")
+
+# 强制设置设备
+if "CUDA_VISIBLE_DEVICES" in os.environ:
+    visible_devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+    # 映射逻辑：如果设了 "7"，那么 torch 看到的 0 号卡实际是物理 7 号卡
+    print(f"Visible GPUs: {visible_devices}")
+    torch.cuda.set_device(0)  # 这时候 0 就是实际的 GPU 7
+else:
+    torch.cuda.set_device(0)
+    
 
 def setup_logger(log_file: Path, is_main_process: bool) -> logging.Logger:
     logger = logging.getLogger("train")
@@ -83,9 +96,15 @@ def main():
         local_files_only=True,
     )
     model = MMACTModelLM.from_pretrained(
-        config.model.mmact.pretrained_model_path, torch_dtype=torch.bfloat16
+        config.model.mmact.pretrained_model_path, 
+        torch_dtype=torch.bfloat16,
+        # Pass flags to model config so that continuous_head is initialized if needed
+        use_continuous_head=getattr(config.model, "use_continuous_head", False),
+        continuous_action_dim=getattr(config, "continuous_action_dim", getattr(config.training, "action_dim", 7)),
+        flow_matching_hidden_dim=getattr(config.model, "flow_matching_hidden_dim", 4096),
     )
 
+    print(f"Accelerator Device{accelerator.device}")
     model.to(accelerator.device)
     action_vocab_size = model.config.action_vocab_size
     max_action_prompt_len = (
@@ -187,7 +206,7 @@ def main():
     ######################################
     @torch.no_grad()
     def prepare_inputs_and_labels_for_mmu_action(batch, eps=1e-3):
-        images, tasks, state_tokens, _, _, action_dims, descriptions, _ = batch
+        images, tasks, state_tokens, _, _, action_dims, descriptions, _, _ = batch
         image_tokens = []
         for imgs in images:
             # img_tokens = []
@@ -247,6 +266,7 @@ def main():
             action_dims,
             _,
             action_vals,
+            _,
         ) = batch
         image_tokens = []
         for imgs in images:
@@ -328,7 +348,7 @@ def main():
         )
 
     def prepare_inputs_and_labels_image(batch, is_train=True, seed=None):
-        images, tasks, state_tokens, _, _, action_dims, _, predict_images = batch
+        images, tasks, state_tokens, _, _, action_dims, _, _, predict_images = batch
         image_tokens = []
         for imgs in images:
             img_tokens = []
@@ -380,10 +400,10 @@ def main():
     #   Optimizer and LR scheduler   #
     #################################
     
-    # --- STRATEGY 1: Freeze Backbone, Train Continuous Head Only ---
+    # --- STRATEGY 1: Freeze Backbone (VL), Train Action Parts & Shared MoT weights ---
     # Check if we are using continuous head and if we want to freeze the backbone
-    if getattr(config, "use_continuous_head", False) and getattr(config.training, "freeze_backbone", False):
-        print("Strategy 1: Freezing Backbone, Training only Continuous Head")
+    if getattr(config.model, "use_continuous_head", False) and getattr(config.training, "freeze_backbone", False):
+        print("Strategy 1: Freezing VL Backbone, Training Action Experts, Shared MoT components & Continuous Head")
         
         # 1. Freeze entire model
         for param in model.parameters():
@@ -395,9 +415,27 @@ def main():
                 param.requires_grad = True
         else:
             raise ValueError("Model does not have 'continuous_head' but use_continuous_head=True")
+        
+        # 3. Unfreeze MoT Action Experts and Shared Attention in MoT blocks
+        # We identify MoT blocks by class name to distinguish from standard frozen VL blocks
+        for name, module in model.named_modules():
+            if "LLaDALlamaMoTBlock" in module.__class__.__name__:
+                for n, p in module.named_parameters():
+                    # Unfreeze GEN-specific weights (Action Experts)
+                    if "_gen" in n:
+                        p.requires_grad = True
+                    # Unfreeze Shared Attention (if it has parameters)
+                    # Note: We exclude "attn_norm" (input LN which is VL-specific here, unless it has _gen)
+                    # "attention" usually refers to the self-attention submodule
+                    if "attention" in n and "attn_norm" not in n:
+                        p.requires_grad = True
             
-        # 3. (Optional) Unfreeze other specific parts if needed (e.g. adapters), 
-        # but here we strictly follow 'freeze backbone'
+            # 4. Unfreeze Final LayerNorm (Shared)
+            # Typically named 'ln_f' at the end of transformer
+            if name.endswith("ln_f") or name.endswith("ln_f"):
+                for p in module.parameters():
+                    p.requires_grad = True
+ 
     
     optimizer_config = config.optimizer.params
     # no decay on bias and layernorm and embedding
@@ -506,7 +544,7 @@ def main():
             )
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(model):
-                input_ids_all = None
+                input_ids_all = None    
                 labels_all = None
                 device = None
 
@@ -575,6 +613,7 @@ def main():
                     raise ValueError(
                         "No training branches enabled: set at least one of co_action/co_t2i/co_mmu to True."
                     )
+                    
                 # if need to use other loss, pass corresponding arguments to this function
                 logits, loss_action, loss_t2i, loss_lm, loss_mmu, loss_continuous = (
                     model.forward_process_vla(

@@ -1592,15 +1592,33 @@ class LLaDAModel(nn.Module):
 
         return LLaDAOutput(logits=logits, attn_key_values=attn_key_values, hidden_states=tuple(all_hidden_states) if output_hidden_states else None)  # type: ignore[arg-type]
 
+from dataclasses import MISSING
 
 def create_model_config_from_pretrained_config(config: LLaDAConfig):
     """
-    Utility function
+    Utility function.
+    Safely builds ModelConfig from a HF-style pretrained config,
+    filling missing fields with dataclass defaults.
     """
 
     kwargs = {}
     for field in fields(ModelConfig):
-        kwargs[field.name] = getattr(config, field.name)
+        # 1. Prefer value from config if present
+        if hasattr(config, field.name):
+            kwargs[field.name] = getattr(config, field.name)
+            continue
+        
+        # 2. Fallback: Dataclass default value
+        if field.default is not MISSING:
+            kwargs[field.name] = field.default
+            continue
+            
+        # 3. Fallback: Dataclass default factory
+        if field.default_factory is not MISSING:
+            kwargs[field.name] = field.default_factory()
+            continue
+            
+        # 4. If neither, we omit (it will raise TypeError if required)
 
     model_config = ModelConfig(**kwargs)
     return model_config

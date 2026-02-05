@@ -826,6 +826,7 @@ class EpisodesHDF5Dataset(Dataset):
             "action_tokens": action_tokens,
             "prev_action_tokens": prev_action_tokens,
             "action_dim": self.action_dim,
+            "action_vals": action_vals,
             # "ral_action": action_vals_raw,
             # "action": action_vals
             # "subtask_text": subtask_text,
@@ -844,6 +845,8 @@ class EpisodesHDF5Dataset(Dataset):
         action_dims = [b["action_dim"] for b in batch]
         descriptions = [b["description"] for b in batch]
         predict_images = [b["predict_image"] for b in batch]
+        action_vals = [b["action_vals"] for b in batch]
+
         return (
             images,
             texts,
@@ -852,5 +855,6 @@ class EpisodesHDF5Dataset(Dataset):
             action_tokens,
             action_dims,
             descriptions,
+            action_vals,
             predict_images,
         )

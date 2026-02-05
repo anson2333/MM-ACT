@@ -2,12 +2,15 @@
 
 import math
 
+import torch.nn.functional as F
 import numpy as np
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
-
+# TODO 硬编码参数，后续整理,目前实现的是libero架构
+# from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX
+ACTION_DIM = 7
+NUM_ACTIONS_CHUNK = 8   
 
 class SinusoidalPositionalEncoding(nn.Module):
     """
@@ -71,7 +74,24 @@ class MLPResNet(nn.Module):
 
     def forward(self, x):
         # x: (batch_size, input_dim)
-        x = self.layer_norm1(x)  # shape: (batch_size, input_dim)
+        
+        # [Robustness Fix] Run the first large LayerNorm in Float32 to prevent NaNs/Overflow with large input_dim (65536) in BFloat16
+        # We manually apply F.layer_norm with casted weights/input
+        x_float = x.float()
+        w_float = self.layer_norm1.weight.float()
+        b_float = self.layer_norm1.bias.float() if self.layer_norm1.bias is not None else None
+        
+        x = F.layer_norm(x_float, self.layer_norm1.normalized_shape, w_float, b_float, self.layer_norm1.eps)
+        
+        # Cast back to FC1 weight dtype (e.g. BFloat16) for the Linear layer
+        target_dtype = self.fc1.weight.dtype
+        if x.dtype != target_dtype:
+            x = x.to(target_dtype)
+
+        # Ensure x matches fc1 dtype (sometimes weights stay in bfloat16 while inputs are float32 or vice versa)
+        if x.dtype != self.fc1.weight.dtype:
+            x = x.to(self.fc1.weight.dtype)
+            
         x = self.fc1(x)  # shape: (batch_size, hidden_dim)
         x = self.relu(x)  # shape: (batch_size, hidden_dim)
         for block in self.mlp_resnet_blocks:
@@ -175,7 +195,7 @@ class DiffusionActionHead(nn.Module):
         batch_size = ground_truth_actions.shape[0]
         device = ground_truth_actions.device
         # Sample random noise with shape equal to actions, used for closed-form forward diffusion.
-        noise = torch.randn(size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM), device=device, dtype=ground_truth_actions.dtype)  # (B, chunk_len, action_dim)
+        noise = torch.randn(size=ground_truth_actions.shape, device=device, dtype=ground_truth_actions.dtype)  # (B, chunk_len, action_dim)
         # Sample random diffusion timesteps (one for each action in batch).
         timesteps = torch.randint(
             low=0, high=self.noise_scheduler.config.num_train_timesteps, size=(batch_size,), device=device
@@ -236,7 +256,7 @@ class FlowMatchingActionHead(nn.Module):
         self.hidden_dim = hidden_dim
         
         self.flow_predictor = NoisePredictionModel(
-            transformer_hidden_dim=hidden_dim*ACTION_DIM, hidden_dim=hidden_dim, action_dim=action_dim
+            transformer_hidden_dim=hidden_dim*action_dim, hidden_dim=hidden_dim, action_dim=action_dim
         )
 
         # Time encoder for positional encoding of timesteps
@@ -244,6 +264,21 @@ class FlowMatchingActionHead(nn.Module):
         
         # Projection for noisy actions to condition the hidden states
         self.action_proj = nn.Linear(action_dim, hidden_dim)
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """Initialize the weights."""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
 
     def sample_noise(self, shape, device):
         """Sample noise from a standard normal distribution."""
@@ -270,11 +305,18 @@ class FlowMatchingActionHead(nn.Module):
         """
         # ground_truth_actions: ground-truth actions
         # - shape: (batch_size, chunk_len, action_dim)
+        
+        # Ensure inputs match model dtype
+        dtype = self.action_proj.weight.dtype
+        if ground_truth_actions.dtype != dtype:
+            ground_truth_actions = ground_truth_actions.to(dtype)
+
+        
         batch_size = ground_truth_actions.shape[0]
         device = ground_truth_actions.device
         
         # Sample random noise with shape equal to actions
-        noise = self.sample_noise((batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM), device)
+        noise = self.sample_noise(ground_truth_actions.shape, device).to(dtype)
         
         # Sample random flow timesteps (one for each action in batch)
         timesteps = self.sample_time(batch_size, device)

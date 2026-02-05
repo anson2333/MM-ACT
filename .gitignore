@@ -1,5 +1,7 @@
 outputs/
 ./results
+data/
+mm-act-10/
 
 # Python cache files
 __pycache__/

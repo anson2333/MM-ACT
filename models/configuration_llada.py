@@ -132,15 +132,15 @@ class ModelConfig():
     LLaDA (model) configuration.
     """
     
-    # MoT Configuration
-    min_mot_layer: int = 0
-    """
-    The first layer index to start using MoT (Mixture of Transformers).
-    """
-    max_mot_layer: int = 1000
-    """
-    The last layer index to stop using MoT.
-    """
+    # # MoT Configuration #TODO
+    # min_mot_layer: int = 0
+    # """
+    # The first layer index to start using MoT (Mixture of Transformers).
+    # """
+    # max_mot_layer: int = 1000
+    # """
+    # The last layer index to stop using MoT.
+    # """
     
     # Note that the defaults for these attributes are equivalent to the base GPT2 model.
 
