@@ -78,3 +78,37 @@
 2026-02-05 17:01:34,728 | INFO | num_epochs: 50
 2026-02-05 17:01:34,728 | INFO | grad_accum_steps (from accelerate): 1
 2026-02-05 17:01:34,728 | INFO | ================================
+2026-02-06 20:41:25,580 | INFO | ======== Training setup ========
+2026-02-06 20:41:25,581 | INFO | output_dir: .
+2026-02-06 20:41:25,581 | INFO | num_epochs: 50
+2026-02-06 20:41:25,581 | INFO | grad_accum_steps (from accelerate): 2
+2026-02-06 20:41:25,581 | INFO | ================================
+2026-02-06 20:59:01,308 | INFO | ======== Training setup ========
+2026-02-06 20:59:01,308 | INFO | output_dir: .
+2026-02-06 20:59:01,308 | INFO | num_epochs: 50
+2026-02-06 20:59:01,308 | INFO | grad_accum_steps (from accelerate): 2
+2026-02-06 20:59:01,308 | INFO | ================================
+2026-02-06 21:02:07,977 | INFO | ======== Training setup ========
+2026-02-06 21:02:07,977 | INFO | output_dir: .
+2026-02-06 21:02:07,977 | INFO | num_epochs: 50
+2026-02-06 21:02:07,977 | INFO | grad_accum_steps (from accelerate): 2
+2026-02-06 21:02:07,977 | INFO | ================================
+2026-02-06 21:12:48,349 | INFO | ======== Training setup ========
+2026-02-06 21:12:48,349 | INFO | output_dir: .
+2026-02-06 21:12:48,349 | INFO | num_epochs: 50
+2026-02-06 21:12:48,350 | INFO | grad_accum_steps (from accelerate): 2
+2026-02-06 21:12:48,350 | INFO | ================================
+2026-02-06 21:30:20,475 | INFO | ======== Training setup ========
+2026-02-06 21:30:20,475 | INFO | output_dir: .
+2026-02-06 21:30:20,475 | INFO | num_epochs: 50
+2026-02-06 21:30:20,476 | INFO | grad_accum_steps (from accelerate): 2
+2026-02-06 21:30:20,476 | INFO | ================================
+2026-02-06 21:38:50,158 | INFO | ======== Training setup ========
+2026-02-06 21:38:50,158 | INFO | output_dir: .
+2026-02-06 21:38:50,158 | INFO | num_epochs: 50
+2026-02-06 21:38:50,158 | INFO | grad_accum_steps (from accelerate): 2
+2026-02-06 21:38:50,158 | INFO | ================================
+2026-02-06 21:52:45,909 | INFO | [epoch 0] step 50/176750 | epoch_step 50/3535 | loss 8.1670 | lr 5e-06
+2026-02-06 21:52:45,909 | INFO | Saving checkpoint to ./checkpoint-step-50
+2026-02-06 22:06:14,898 | INFO | [epoch 0] step 100/176750 | epoch_step 100/3535 | loss 6.8135 | lr 1e-05
+2026-02-06 22:06:14,898 | INFO | Saving checkpoint to ./checkpoint-step-100

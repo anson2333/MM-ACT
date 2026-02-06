@@ -69,7 +69,7 @@ def main():
             "gradient_accumulation_steps", 1
         ),
         mixed_precision=config.training.get("mixed_precision", "bf16"),
-        log_with="tensorboard",
+        log_with="wandb",  # Updated to use WandB for visualization
         project_dir=str(logging_dir),
         split_batches=True,
     )
@@ -77,6 +77,15 @@ def main():
         accelerator.state.deepspeed_plugin.deepspeed_config[
             "train_micro_batch_size_per_gpu"
         ] = config.training.batch_size
+                
+        # [DeepSpeed Fix] Enable 16-bit weight gathering for ZeRO-3 saving
+        ds_config = accelerator.state.deepspeed_plugin.deepspeed_config
+        if "zero_optimization" in ds_config:
+             # Ensure the dictionnary is mutable and exists
+             if ds_config["zero_optimization"].get("stage", 0) == 3:
+                 print("DeepSpeed ZeRO-3 detected. Enabling 'stage3_gather_16bit_weights_on_model_save'.")
+                 ds_config["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = True
+
     accelerator.init_trackers(
         project_name="mmact_train",
         config={
@@ -106,6 +115,15 @@ def main():
 
     print(f"Accelerator Device{accelerator.device}")
     model.to(accelerator.device)
+    
+    
+    # [Distributed Fix] Synchronize new randomly initialized parameters (e.g., continuous_head, MoT experts)
+    # across all ranks to ensure consistent starting point.
+    if accelerator.num_processes > 1:
+        for p in model.parameters():
+            torch.distributed.broadcast(p.data, src=0)
+            
+    
     action_vocab_size = model.config.action_vocab_size
     max_action_prompt_len = (
         config.dataset.preprocessing.max_seq_length
@@ -402,39 +420,63 @@ def main():
     
     # --- STRATEGY 1: Freeze Backbone (VL), Train Action Parts & Shared MoT weights ---
     # Check if we are using continuous head and if we want to freeze the backbone
-    if getattr(config.model, "use_continuous_head", False) and getattr(config.training, "freeze_backbone", False):
+    # NOTE: Check both root config "use_continuous_head" and config.model "use_continuous_head" to be safe
+    use_cont = getattr(config, "use_continuous_head", False) or getattr(config.model, "use_continuous_head", False)
+    
+    if use_cont and getattr(config.training, "freeze_backbone", False):
         print("Strategy 1: Freezing VL Backbone, Training Action Experts, Shared MoT components & Continuous Head")
         
         # 1. Freeze entire model
         for param in model.parameters():
             param.requires_grad = False
             
-        # 2. Unfreeze continuous head
-        if hasattr(model, "continuous_head"):
-            for param in model.continuous_head.parameters():
-                param.requires_grad = True
-        else:
-            raise ValueError("Model does not have 'continuous_head' but use_continuous_head=True")
-        
-        # 3. Unfreeze MoT Action Experts and Shared Attention in MoT blocks
-        # We identify MoT blocks by class name to distinguish from standard frozen VL blocks
-        for name, module in model.named_modules():
-            if "LLaDALlamaMoTBlock" in module.__class__.__name__:
-                for n, p in module.named_parameters():
-                    # Unfreeze GEN-specific weights (Action Experts)
-                    if "_gen" in n:
-                        p.requires_grad = True
-                    # Unfreeze Shared Attention (if it has parameters)
-                    # Note: We exclude "attn_norm" (input LN which is VL-specific here, unless it has _gen)
-                    # "attention" usually refers to the self-attention submodule
-                    if "attention" in n and "attn_norm" not in n:
-                        p.requires_grad = True
+        # 2. Robust Unfreezing based on Parameter Names
+        # This replaces the class-based unfreezing which can be fragile with DeepSpeed or different Block types
+        unfrozen_count = 0
+        for name, param in model.named_parameters():
+             # 2.1 Continuous Head (always train)
+             if "continuous_head" in name:
+                 param.requires_grad = True
+                 
+             # 2.2 Action Experts and MoT specific norms (identified by _gen suffix)
+             # Covers: expert_gen, ff_norm_gen, attn_norm_gen.weight, etc.
+             elif "_gen" in name:
+                 param.requires_grad = True
+                 
+             # 2.3 Shared Attention in Transformer
+             # We unfreeze QKV / Output projections of the LLM, but NOT the Vision Tower
+             elif "attention" in name and "vision" not in name:
+                 # Exclude "attn_norm" (Input LayerNorm) unless it has _gen (handled above)
+                 # Note: "attn_norm" usually doesn't contain string "attention", but we keep check for safety
+                 if "attn_norm" not in name:
+                     param.requires_grad = True
             
-            # 4. Unfreeze Final LayerNorm (Shared)
-            # Typically named 'ln_f' at the end of transformer
-            if name.endswith("ln_f") or name.endswith("ln_f"):
-                for p in module.parameters():
-                    p.requires_grad = True
+             # 2.4 Final LayerNorm 
+             elif "ln_f" in name:
+                 param.requires_grad = True
+            
+             if param.requires_grad:
+                 unfrozen_count += 1
+        
+        print(f"[Strategy 1 Info] Unfrozen {unfrozen_count} parameter tensors via name matching.")
+        # [Debugging Logic] If count is 0, print ALL parameter names to help diagnosis
+        if unfrozen_count == 0:
+            print("WARNING: Name matching found 0 parameters to unfreeze. Debugging ALL names:")
+            for n, _ in list(model.named_parameters()):
+                print(f"  [Scan] {n}")
+
+
+        if unfrozen_count == 0:
+            print("WARNING: Name matching found 0 parameters to unfreeze. Debugging names:")
+            for n, _ in list(model.named_parameters())[:20]:
+                print(f"  - {n}")
+        
+        # [Important] If unfrozen_count is still 0, we must stop and check the logs
+        if unfrozen_count == 0:
+            raise ValueError("No trainable parameters found! Check model structure and parameter names.")
+        
+        # 3. (Optional) Unfreeze other specific parts if needed (e.g. adapters), 
+        # but here we strictly follow 'freeze backbone'
  
     
     optimizer_config = config.optimizer.params
@@ -462,9 +504,12 @@ def main():
     ]
 
     # Verify we have parameters to optimize
-    trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Number of trainable parameters: {trainable_params_count}")
-    if trainable_params_count == 0:
+    trainable_params_candidates = [p for p in model.parameters() if p.requires_grad]
+    print(f"Number of trainable tensors: {len(trainable_params_candidates)}")
+    
+    # In DeepSpeed ZeRO-3 init, p.numel() might be 0 before accelerator.prepare().
+    # We trust the tensor count instead of numel sum in this case.
+    if len(trainable_params_candidates) == 0:
         raise ValueError("No trainable parameters found! Check freezing logic.")
 
     optimizer_type = config.optimizer.name
@@ -703,14 +748,30 @@ def main():
                             loss_avg,
                             current_lr,
                         )
-            if getattr(config.training, "save_step", False):
-                if global_update_step % config.training.save_step == 0 and step != 0:
+                # Save model based on global_update_step
+                save_step_interval = getattr(config.training, "save_step", False)
+                if save_step_interval and (global_update_step % save_step_interval == 0):
+                    steps_output_dir = os.path.join(output_dir, f"checkpoint-step-{global_update_step}")
+                    
+                    # [Important] Save accelerator state (Optimizer, Scheduler, RNG) for resuming training
+                    # This checks for existing dir, and most importantly MUST run on all processes
+                    accelerator.save_state(steps_output_dir)
+                        
+                    # [DeepSpeed Fix] Use accelerator.get_state_dict(model) to gather parameters 
+                    # from all GPUs before saving. This supports ZeRO-3.
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    state_dict = accelerator.get_state_dict(model)
+            
                     if accelerator.is_main_process:
-                        steps_output_dir = os.path.join(output_dir, f"steps_{step}")
-                        accelerator.unwrap_model(model).save_pretrained(
-                            steps_output_dir
+                        logger.info(f"Saving checkpoint to {steps_output_dir}")
+                        unwrapped_model.save_pretrained(
+                            steps_output_dir, 
+                            is_main_process=True, 
+                            save_function=accelerator.save, 
+                            state_dict=state_dict
                         )
                         uni_prompting.text_tokenizer.save_pretrained(steps_output_dir)
+
         if accelerator.is_main_process:
             pbar.close()
             logger.info("Epoch %s finished.", epoch)

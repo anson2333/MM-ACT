@@ -1215,10 +1215,22 @@ class LLaDABlockGroup(nn.ModuleList):
                     and block_idx % 4 == 0
                 )
             ):
+                # Wrapper to adapt block forward signature for checkpointing and drop second return value (cache)
+                def checkpoint_forward_wrapper(module, x_input, attn_bias, l_past, u_cache, g_indices):
+                     out, _ = module(x_input, attention_bias=attn_bias, layer_past=l_past, use_cache=u_cache, gen_indices=g_indices)
+                     return out
+
                 # shape: (batch_size, seq_len, d_model)
-                x, cache = self._activation_checkpoint_fn(  # type: ignore
-                    block, x, **block_kwargs
-                )       # TODO checkpoint中不匹配
+                x = self._activation_checkpoint_fn(
+                    checkpoint_forward_wrapper,
+                    block,
+                    x,
+                    attention_bias,
+                    layer_past,
+                    use_cache,
+                    gen_indices
+                )
+                cache = None
             else:
                 # shape: (batch_size, seq_len, d_model)
                 x, cache = block(x, **block_kwargs)

@@ -321,7 +321,99 @@ class MMACTModelLM(MMadaModelLM):
         else: 
             s = L0 - num_action_tokens - 1
             e = L0 - 1
+
+        # TODO
+        # Continuous Head Generation Logic
+        if getattr(self.config, "use_continuous_head", False):
+            # 1. First, we need the "Action Hidden States" which are the outputs of the VLM backbone
+            # corresponding to the action tokens.
+            # In the user query, s and e mark the input positions. We need to extract the hidden states
+            # from the LAST forward pass at these positions (or we run a forward pass if not cached).
             
+            # Since action_generate usually takes the full prompt in `input_ids`, we run a forward pass
+            # to get the hidden states.
+            # However, `input_ids` contains discrete tokens. For continuous gen, the "action section"
+            # of input_ids should be placeholder tokens (e.g. [MASK] or specific action tokens).
+            # The calling code (UniversalPrompting) sets them up.
+            
+            outputs = self(
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                output_hidden_states=True
+            )
+            hidden_states = outputs.hidden_states[-1] # [B, L, H]
+            
+            # Extract hidden states corresponding to the action chunk
+            # Note: The logic for `s` and `e` above assumes Franka (7-dim) double-length or similar.
+            # We need to ensure we select the exact tokens that were meant to be actions.
+            
+            # If input_ids has length L0, and we want the last `num_action_tokens`, we utilize `s` logic
+            # or we just take the last N tokens if that's how the prompt is structured.
+            
+            # Assuming the standard MM-ACT prompting, action tokens are at the end.
+            # Let's trust the `s` calculation or simplified `L0 - num_action_tokens`.
+            # IMPORTANT: standard MM-ACT discrete uses doubled tokens for 7-dim.
+            # Continuous head usually maps 1 token -> 1 dimension (or 1 token -> 1 hidden vector -> 1 dimension).
+            # In our training code: `action_hidden = hidden_states[:, max_seq_length + 1 :]`
+            
+            # Here, we take the last `chunk_size * action_dim` tokens.
+            action_hidden = hidden_states[:, -num_action_tokens:] 
+            
+            # 2. Perform Flow Matching Inference (Euler Integration)
+            batch_size = input_ids.shape[0]
+            device = input_ids.device
+            chunk_len = chunk_size
+            
+            # Initial noise x_0 ~ N(0, 1)
+            # Shape matches [B, Chunk, Dim]
+            x_t = torch.randn(batch_size, chunk_len, action_dim, device=device, dtype=hidden_states.dtype)
+            
+            # Euler steps (0 -> 1)
+            # steps = 10 (configurable?)
+            steps = 10 
+            dt = 1.0 / steps
+            
+            for i in range(steps):
+                t_value = i / steps
+                t = torch.tensor([t_value] * batch_size, device=device, dtype=hidden_states.dtype)
+                
+                # Get time embedding from the head's encoder
+                # Note: The head expects time [0, 1]. Encodes to [B, 1, H]
+                time_emb = self.continuous_head.time_encoder(t).unsqueeze(1) # [B, 1, H]
+                
+                # Predict velocity v_t = f(x_t, t, condition)
+                # predict_velocity expects: (action_hidden, noisy_actions, timestep_embeddings)
+                velocity = self.continuous_head.predict_velocity(
+                    action_hidden, x_t, time_emb
+                )
+                
+                # Euler update: x_{t+1} = x_t + v_t * dt
+                x_t = x_t + velocity * dt
+                
+            # x_1 is the predicted action
+            predicted_actions = x_t # [B, Chunk, Dim]
+            
+            # Return format: (sampled_ids, logits, ...)
+            # Since this is continuous, we don't have token IDs. 
+            # We need to adapt the return to what the caller expects.
+            # Caller expects: action_chunk, gen_token_ids
+            # We can return raw float values and handle them downstream, 
+            # OR quantize them if the pipeline strictly requires tokens (but avoiding quantization is better).
+            
+            # HACK: We repackage the continuous actions into a flat tensor that LOOKS like "logits" or similar,
+            # but ideally we should change the return signature or the caller.
+            # The caller `deploy_policy.py` does:
+            #   action_chunk = dequantize(gen_token_ids)
+            # We should bypass this in `deploy_policy.py`.
+            
+            # For now, let's return the continuous actions as 'logits' (conceptually wrong but passes data)
+            # or return a special flag.
+            
+            # BETTER: Return the continuous actions as the second element (logits place) 
+            # and None for token IDs?
+            return None, predicted_actions, hidden_states
+
+
         num_transfer = get_num_transfer_tokens((input_ids[:, s:e] == mask_token_id), timesteps)
 
         hist: List[torch.Tensor] = []

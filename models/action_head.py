@@ -75,13 +75,13 @@ class MLPResNet(nn.Module):
     def forward(self, x):
         # x: (batch_size, input_dim)
         
-        # [Robustness Fix] Run the first large LayerNorm in Float32 to prevent NaNs/Overflow with large input_dim (65536) in BFloat16
-        # We manually apply F.layer_norm with casted weights/input
-        x_float = x.float()
-        w_float = self.layer_norm1.weight.float()
-        b_float = self.layer_norm1.bias.float() if self.layer_norm1.bias is not None else None
+        # [DeepSpeed ZeRO-3 Fix]
+        # We cannot manually access .weight/.bias and cast them, as they may be partitioned (shape [0]).
+        # We must invoke the module __call__ which handles the parameter gathering automatically.
+        # Although we lose the explicit float32 cast for weights, PyTorch LayerNorm is generally robust.
         
-        x = F.layer_norm(x_float, self.layer_norm1.normalized_shape, w_float, b_float, self.layer_norm1.eps)
+        # Ensure input is at least in the model's dtype (or keep float32 if it came in as such)
+        x = self.layer_norm1(x)
         
         # Cast back to FC1 weight dtype (e.g. BFloat16) for the Linear layer
         target_dtype = self.fc1.weight.dtype

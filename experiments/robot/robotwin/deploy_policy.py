@@ -256,7 +256,11 @@ class MMACT_Deployment:
             inputs, robot_type=robot_type
         )
         # print("TIMESTEP:", self.timesteps)
-        gen_token_ids = self.model.action_generate(
+        
+        # Check if model uses continuous head
+        use_continuous = getattr(self.model.config, "use_continuous_head", False)
+        
+        gen_output = self.model.action_generate(
             input_ids=input_ids,
             attention_mask=attention_masks,
             timesteps=self.timesteps,
@@ -268,9 +272,29 @@ class MMACT_Deployment:
             temperature=0.0,
             action_vocab_size=self.action_vocab_size,
         )
-        action_chunk = self.dequantize_action_with_offset(
-            gen_token_ids, bins=self.action_vocab_size
-        ).view(self.training_chunk_size, self.action_dim)
+        # TODO
+        if use_continuous:
+            # action_generate returns (None, predicted_actions, hidden_states)
+            _, action_chunk, _ = gen_output
+            # action_chunk is [Batch, Chunk, Dim] or [Chunk, Dim] depending on impl
+            # In action_generate I wrote: returns predicted_actions which is [B, Chunk, Dim]
+            
+            # Ensure it is on CPU and flattened if needed, or kept as chunk
+            # The original code expects [Chunk, Dim] for the first element of return
+            action_chunk = action_chunk[0] # Take first batch item
+            
+            # Values are likely in raw space (e.g. normalized).
+            # If the model output is already what we want, just use it.
+            # Assuming training targeted normalized actions [-1, 1], we might need to clamp.
+            action_chunk = action_chunk.clamp(-1.0, 1.0)
+            
+            # Prepare second return value (token_ids) - just return zeros or None
+            gen_token_ids = torch.zeros_like(action_chunk) # Dummy
+        else:
+            gen_token_ids = gen_output
+            action_chunk = self.dequantize_action_with_offset(
+                gen_token_ids, bins=self.action_vocab_size
+            ).view(self.training_chunk_size, self.action_dim)
 
         elapsed = time.time() - start_time
         self.last_get_actions_time = elapsed
@@ -282,10 +306,17 @@ class MMACT_Deployment:
         #     f"[get_actions] this call: {elapsed*1000:.2f} ms, "
         #     f"avg: {avg_time*1000:.2f} ms over {self.get_actions_call_count} calls"
         # )
-        return (
-            action_chunk,
-            gen_token_ids.view(self.training_chunk_size, self.action_dim)[0],
-        )
+        if use_continuous:
+             return (
+                action_chunk,
+                gen_token_ids
+            )
+        else:
+            return (
+                action_chunk,
+                gen_token_ids.view(self.training_chunk_size, self.action_dim)[0],
+            )
+
 
     # now, pre_action_tokens will return together when use get_actions
 

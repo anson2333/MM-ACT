@@ -7,11 +7,11 @@ seed: null
 instruction_type: unseen
 
 # Add Parameters You Need
-model_path: <your model path>
+model_path: "/mnt/pfs/scalelab2/hms/MM-ACT/model_train/checkpoint-step-2"
 #IMPORTANT!
 ignore_state: False
 preprocessing_max_seq_length: 1120
-vq_model_path: <your vq model path>
+vq_model_path: "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/models--showlab--magvitv2/snapshots/5c3fa78f8b3523347c5cd1a4c97f3c4e96f33d5d"
 vocab_offset: 134656
 device: cuda:0
 timesteps: 1
@@ -23,3 +23,4 @@ parallel_num: 1
 index: 0
 store_t2i: False
 t2i_ignore_state: True
+use_continuous_head: True

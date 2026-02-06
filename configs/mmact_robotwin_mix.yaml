@@ -1,7 +1,7 @@
 experiment:
   project: "demo"
   name: ""
-  output_dir: ""
+  output_dir: "/mnt/pfs/scalelab2/hms/MM-ACT/model_train"
 
 model:
   mmact:
@@ -11,7 +11,7 @@ model:
 
   use_continuous_head: True
   flow_matching_hidden_dim: 4096
-  continuous_action_dim: 7 # Or 16 depending on robotwin
+  continuous_action_dim: 16 # Or 16 depending on robotwin
   
   vq_model:
     type: "magvitv2"
@@ -34,7 +34,7 @@ dataset:
     - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/place_can_basket/demo_clean"
 
 training:
-  batch_size: 2 # total batch size = batch size *(co_action + co_t2i + co_mmu), co_* = 0/1
+  batch_size: 5 # total batch size = batch size *(co_action + co_t2i + co_mmu), co_* = 0/1
   co_action: True
   co_t2i: False
   co_mmu: False
@@ -60,6 +60,7 @@ training:
   action_dim: 16
   action_loss_type: "single"
   use_prev_action: False
+  save_step: 500
 
 
 optimizer:
