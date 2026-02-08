@@ -75,14 +75,24 @@ class MLPResNet(nn.Module):
     def forward(self, x):
         # x: (batch_size, input_dim)
         
-        # [DeepSpeed ZeRO-3 Fix]
-        # We cannot manually access .weight/.bias and cast them, as they may be partitioned (shape [0]).
-        # We must invoke the module __call__ which handles the parameter gathering automatically.
-        # Although we lose the explicit float32 cast for weights, PyTorch LayerNorm is generally robust.
+       
+        # [DeepSpeed ZeRO-3 / Mixed Precision Fix]
+        # LayerNorm often stays in Float32 even if model is loaded as BFloat16.
+        # But Linear layers might be BFloat16. 
+        # We must cast input to LayerNorm's expected dtype, then cast back for subsequent layers.
+
+        # ----- LayerNorm 1 -----
+        # Debugging to confirm hypothesis
+        # print(f"[DEBUG] Input: {x.dtype}, LN1 Weight: {self.layer_norm1.weight.dtype}")
         
-        # Ensure input is at least in the model's dtype (or keep float32 if it came in as such)
-        x = self.layer_norm1(x)
+        dtype_in = x.dtype
+        ln1_dtype = self.layer_norm1.weight.dtype
         
+        if dtype_in != ln1_dtype:
+            x = self.layer_norm1(x.to(ln1_dtype)).to(dtype_in)
+        else:
+            x = self.layer_norm1(x)
+       
         # Cast back to FC1 weight dtype (e.g. BFloat16) for the Linear layer
         target_dtype = self.fc1.weight.dtype
         if x.dtype != target_dtype:
@@ -96,8 +106,19 @@ class MLPResNet(nn.Module):
         x = self.relu(x)  # shape: (batch_size, hidden_dim)
         for block in self.mlp_resnet_blocks:
             x = block(x)  # shape: (batch_size, hidden_dim)
-        x = self.layer_norm2(x)  # shape: (batch_size, hidden_dim)
+            
+        # ----- LayerNorm 2 -----
+        ln2_dtype = self.layer_norm2.weight.dtype
+        if x.dtype != ln2_dtype:
+            x = self.layer_norm2(x.to(ln2_dtype)).to(dtype_in)
+        else:
+            x = self.layer_norm2(x)
+
+        # ----- FC2 -----
         x = self.fc2(x)  # shape: (batch_size, output_dim)
+        
+
+
         return x
 
 

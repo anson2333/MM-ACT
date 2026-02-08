@@ -34,10 +34,10 @@ dataset:
     - "/mnt/pfs/scalelab2/hms/MM-ACT/data/RoboTwin/demo_clean/place_can_basket/demo_clean"
 
 training:
-  batch_size: 5 # total batch size = batch size *(co_action + co_t2i + co_mmu), co_* = 0/1
+  batch_size: 1 # total batch size = batch size *(co_action + co_t2i + co_mmu), co_* = 0/1
   co_action: True
-  co_t2i: False
-  co_mmu: False
+  co_t2i: True
+  co_mmu: True
   mmu_ignore_state: True
   freeze_backbone: True  # Strategy 1: Freeze Backbone
   mmu_learn_eos: False #if mmu generation learn to generate <eos>

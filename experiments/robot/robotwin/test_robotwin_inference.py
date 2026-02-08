@@ -6,6 +6,11 @@ import yaml
 import numpy as np
 from pathlib import Path
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
+
+# 验证
+print(f"Available GPUs: {torch.cuda.device_count()}")
+print(f"Current GPU: {torch.cuda.current_device()}")
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
@@ -16,35 +21,33 @@ def test_inference():
     config_path = os.path.join(os.path.dirname(__file__), "deploy_policy.yml")
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+        # Use arguments from the YAML config
+        args = config.copy()
+        
+        print(f"Loading config from {config_path}")
+        print(f"Target Model Path: {args['model_path']}")
+        
+        if not os.path.exists(args['model_path']):
+            print(f"WARNING: The model path '{args['model_path']}' does not exist on this machine.")
+            print("If you are running this script locally but the model is on a server, please adjust the path or run this script on the server.")
+        
+        # args["device"] = "cuda:0" if torch.cuda.is_available() else "cpu"
+        print(f"Using Device: {args.get('device', 'auto')}")
 
-    # Override with checkpoint path if needed (user provided checkpoint-step-50)
-    # Assuming the user usually provides arguments via command line, we mock them here.
-    # We use the checkpoint-step-50 path provided in the prompt context if accessible, 
-    # otherwise we use placeholders.
-    
-    # Path from user context
-    ckpt_path = "/mnt/pfs/scalelab2/hms/MM-ACT/checkpoint-step-50" 
-    # Note: I am not on the user's machine, so this path might fail if I try to run it.
-    # But the user asked for CODE modification/analysis.
-    
-    # I will create a script the USER can run.
-    print("Test script for MMACT continuous action evaluation.")
-    
-    # Mock Args
-    args = config.copy()
-    args["model_path"] = ckpt_path # User should update this
-    args["vq_model_path"] = "/mnt/pfs/scalelab2/yitian-proj/MM-ACT/huggingface/hub/models--showlab--magvitv2/snapshots/5c3fa78f8b3523347c5cd1a4c97f3c4e96f33d5d" # Placeholder
-    args["action_dim"] = 16 # RobotWin likely 16 (Aloha) or 7 (Franka)
-    args["robot_type"] = "aloha-agilex" # From eval.sh/yml default
-    args["device"] = "cuda:0" if torch.cuda.is_available() else "cpu"
-    
-    print(f"Loading model from {args['model_path']}...")
-    try:
-        model = get_model(args)
-    except Exception as e:
-        print(f"Failed to load model (expected if path is wrong): {e}")
-        print("Please ensure 'model_path' in this script matches your actual checkpoint.")
-        return
+        print(f"Loading model architecture...")
+        try:
+            model = get_model(args)
+        except OSError as e:
+            print(f"\n[Error] Failed to load checkpoint. Typical reasons:")
+            print("1. The path is incorrect.")
+            print("2. The checkpoint relies on DeepSpeed ZeRO-3 artifacts but 'model.safetensors' (or sharded files) are missing/empty.")
+            print(f"System Error: {e}")
+            return
+        except Exception as e:
+            print(f"\n[Error] Unexpected error loading model: {e}")
+            import traceback
+            traceback.print_exc()
+            return
 
     print("Model loaded successfully.")
     
@@ -68,11 +71,19 @@ def test_inference():
     # Prev action
     dummy_prev_action = torch.zeros((16,), dtype=torch.int32) # Token IDs
     
-    inputs = ([dummy_images], text_task, dummy_state, dummy_prev_action)
+    inputs = (dummy_images, text_task, dummy_state, dummy_prev_action)
     
     print("Running get_actions...")
     with torch.no_grad():
-        action_chunk, token_ids = model.get_actions(inputs, robot_type=args["robot_type"])
+        robot_type = args.get("robot_type", "aloha-agilex")
+        # Validate robot_type vs action_dim
+        if args.get("action_dim", 16) > 7 and robot_type == "franka":
+            print("[WARNING] action_dim > 7 but robot_type is 'franka'. Overriding to 'aloha-agilex'.")
+            robot_type = "aloha-agilex"
+  
+        
+        print(f"Using Robot Type: {robot_type}")
+        action_chunk, token_ids = model.get_actions(inputs, robot_type=robot_type)
         
     print("Inference successful!")
     print(f"Action Chunk Shape: {action_chunk.shape}")

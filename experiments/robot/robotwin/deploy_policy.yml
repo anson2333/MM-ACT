@@ -7,7 +7,7 @@ seed: null
 instruction_type: unseen
 
 # Add Parameters You Need
-model_path: "/mnt/pfs/scalelab2/hms/MM-ACT/model_train/checkpoint-step-2"
+model_path: "/mnt/pfs/scalelab2/hms/MM-ACT/model_train/checkpoint-step-3000"
 #IMPORTANT!
 ignore_state: False
 preprocessing_max_seq_length: 1120
@@ -24,3 +24,4 @@ index: 0
 store_t2i: False
 t2i_ignore_state: True
 use_continuous_head: True
+robot_type: "aloha-agilex" # "franka" or "locobot"

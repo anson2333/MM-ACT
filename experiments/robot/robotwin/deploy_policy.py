@@ -272,25 +272,21 @@ class MMACT_Deployment:
             temperature=0.0,
             action_vocab_size=self.action_vocab_size,
         )
-        # TODO
+        
         if use_continuous:
             # action_generate returns (None, predicted_actions, hidden_states)
             _, action_chunk, _ = gen_output
-            # action_chunk is [Batch, Chunk, Dim] or [Chunk, Dim] depending on impl
-            # In action_generate I wrote: returns predicted_actions which is [B, Chunk, Dim]
+            # action_chunk is [Batch, Chunk, Dim] from action_generate
+            # Take first batch item: [Chunk, Dim]
+            action_chunk = action_chunk[0]
             
-            # Ensure it is on CPU and flattened if needed, or kept as chunk
-            # The original code expects [Chunk, Dim] for the first element of return
-            action_chunk = action_chunk[0] # Take first batch item
-            
-            # Values are likely in raw space (e.g. normalized).
-            # If the model output is already what we want, just use it.
-            # Assuming training targeted normalized actions [-1, 1], we might need to clamp.
+            # Clamp to [-1, 1] range (normalized action space)
             action_chunk = action_chunk.clamp(-1.0, 1.0)
             
-            # Prepare second return value (token_ids) - just return zeros or None
-            gen_token_ids = torch.zeros_like(action_chunk) # Dummy
+            # For continuous mode, token_ids is not used but returned for API compatibility
+            gen_token_ids = None
         else:
+            # Discrete mode: gen_output is token IDs
             gen_token_ids = gen_output
             action_chunk = self.dequantize_action_with_offset(
                 gen_token_ids, bins=self.action_vocab_size
@@ -306,17 +302,10 @@ class MMACT_Deployment:
         #     f"[get_actions] this call: {elapsed*1000:.2f} ms, "
         #     f"avg: {avg_time*1000:.2f} ms over {self.get_actions_call_count} calls"
         # )
-        if use_continuous:
-             return (
-                action_chunk,
-                gen_token_ids
-            )
-        else:
-            return (
-                action_chunk,
-                gen_token_ids.view(self.training_chunk_size, self.action_dim)[0],
-            )
-
+        # Return format: (action_chunk, token_ids)
+        # action_chunk: [Chunk, Dim] - the continuous/discrete action predictions
+        # token_ids: token IDs (discrete mode) or None (continuous mode)
+        return (action_chunk, gen_token_ids)
 
     # now, pre_action_tokens will return together when use get_actions
 
@@ -365,9 +354,13 @@ def get_model(usr_args):  # from deploy_policy.yml and eval.sh (overrides)
 
 def eval(TASK_ENV, model, observation):
     """
-    All the function interfaces below are just examples
-    You can modify them according to your implementation
-    But we strongly recommend keeping the code logic unchanged
+    Evaluation loop for a single RoboTwin episode.
+    Iterates through action chunks and executes them in the simulated environment.
+    
+    Args:
+        TASK_ENV: RoboTwin simulation environment
+        model: MMACT_Deployment instance
+        observation: Current environment observation
     """
     obs = encode_obs(observation)  # Post-Process Observation
     instruction = TASK_ENV.get_instruction()
@@ -378,15 +371,20 @@ def eval(TASK_ENV, model, observation):
     flat_prev_actions_tensors = torch.tensor([])
     inputs = (image_tensor, text_task, state_tensor, flat_prev_actions_tensors)
 
+    # Get actions from model (robot_type should match model configuration)
+    # Default to aloha-agilex for ALOHA-class robots
     action_chunk, token_ids = model.get_actions(
         inputs, robot_type="aloha-agilex"
-    )  # Get Action according to observation chunk
+    )
+    
+    # Convert to CPU and float32 for environment interaction
     action_chunk = action_chunk.detach().cpu()
-    for action in action_chunk:  # Execute each step of the action
-        TASK_ENV.take_action(
-            action, action_type="ee"
-        )
-
+    if action_chunk.dtype == torch.bfloat16:
+        action_chunk = action_chunk.to(torch.float32)
+    
+    # Execute each action in the chunk sequentially
+    for action in action_chunk:
+        TASK_ENV.take_action(action, action_type="ee")
         observation = TASK_ENV.get_obs()
         obs = encode_obs(observation)
 
